@@ -15,14 +15,16 @@ CORS(app)
 # Store tracks in memory
 tracks = {}
 
-# Complete HTML with Catalan UI, pause button, and full JavaScript
+# Complete HTML with FIXED map initialization
 HTML_CONTENT = '''<!DOCTYPE html>
 <html lang="ca">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rastrejador de Rutes GPS</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" 
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {
@@ -35,6 +37,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            overflow: hidden;
         }
         
         .container {
@@ -208,9 +211,14 @@ HTML_CONTENT = '''<!DOCTYPE html>
             color: #eb3349;
         }
         
+        /* CRITICAL: Explicit height for map */
         #map {
             flex: 1;
+            width: 100%;
+            height: 500px; /* Explicit height as fallback */
             min-height: 400px;
+            position: relative;
+            background: #f0f0f0;
             box-shadow: inset 0 4px 20px rgba(0, 0, 0, 0.1);
         }
         
@@ -345,6 +353,10 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 justify-content: center;
                 padding: 16px 28px;
             }
+            
+            #map {
+                height: 400px;
+            }
         }
         
         .toast {
@@ -442,54 +454,109 @@ HTML_CONTENT = '''<!DOCTYPE html>
         <p id="toastMessage"></p>
     </div>
     
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Load Leaflet JS with integrity check -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
     <script>
+        console.log('=== DIAGNOSTIC START ===');
+        console.log('Leaflet loaded:', typeof L !== 'undefined');
+        console.log('Map element exists:', document.getElementById('map') !== null);
+        
         // Global variables
         let map, trackId = null, isTracking = false, isPaused = false, watchId = null;
         let routePolyline = null, currentMarker = null, routePoints = [], totalDistance = 0;
         let startMarker = null, trackingStartTime = null, durationInterval = null;
         let pausedTime = 0, pauseStartTime = null;
         
-        // Initialize map
+        // Initialize map with error handling
         function initMap() {
-            console.log('Initializing map...');
-            map = L.map('map').setView([20, 0], 2);
+            console.log('=== initMap() called ===');
             
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contribuïdors',
-                maxZoom: 19
-            }).addTo(map);
-            
-            // Try to get initial position
-            if (navigator.geolocation) {
-                console.log('Geolocation is supported');
-                navigator.geolocation.getCurrentPosition(
-                    (position) => {
-                        const lat = position.coords.latitude;
-                        const lon = position.coords.longitude;
-                        console.log('Initial position:', lat, lon);
-                        map.setView([lat, lon], 15);
-                        
-                        // Add marker for current location
-                        L.circleMarker([lat, lon], {
-                            radius: 8,
-                            fillColor: '#667eea',
-                            color: '#fff',
-                            weight: 2,
-                            opacity: 1,
-                            fillOpacity: 0.8
-                        }).addTo(map).bindPopup('La teva ubicació actual');
-                        
-                        showToast('Ubicació trobada', 'A punt per començar el seguiment!');
-                    },
-                    (error) => {
-                        console.log('Initial position error:', error);
-                        showAlert('No es pot obtenir la teva ubicació. Assegura\'t que els serveis d\'ubicació estiguin activats.', 'warning');
-                    }
-                );
-            } else {
-                console.log('Geolocation not supported');
-                showAlert('La geolocalització no està suportada pel teu navegador', 'error');
+            try {
+                // Check if Leaflet is loaded
+                if (typeof L === 'undefined') {
+                    console.error('ERROR: Leaflet (L) is not defined!');
+                    showAlert('Error: No es pot carregar el mapa. Si us plau, refresca la pàgina.', 'error');
+                    return;
+                }
+                
+                // Check if map container exists
+                const mapContainer = document.getElementById('map');
+                if (!mapContainer) {
+                    console.error('ERROR: Map container not found!');
+                    return;
+                }
+                
+                console.log('Map container dimensions:', mapContainer.offsetWidth, 'x', mapContainer.offsetHeight);
+                
+                // Initialize map
+                console.log('Creating Leaflet map...');
+                map = L.map('map', {
+                    center: [20, 0],
+                    zoom: 2,
+                    zoomControl: true
+                });
+                
+                console.log('Map created:', map);
+                
+                // Add tile layer
+                console.log('Adding tile layer...');
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contribuïdors',
+                    maxZoom: 19
+                }).addTo(map);
+                
+                console.log('Tile layer added');
+                
+                // Force map to recognize its size
+                setTimeout(function() {
+                    map.invalidateSize();
+                    console.log('Map size invalidated/refreshed');
+                }, 100);
+                
+                // Try to get initial position
+                if (navigator.geolocation) {
+                    console.log('Geolocation is supported, requesting position...');
+                    navigator.geolocation.getCurrentPosition(
+                        (position) => {
+                            const lat = position.coords.latitude;
+                            const lon = position.coords.longitude;
+                            console.log('Initial position received:', lat, lon);
+                            map.setView([lat, lon], 15);
+                            
+                            // Add marker for current location
+                            L.circleMarker([lat, lon], {
+                                radius: 8,
+                                fillColor: '#667eea',
+                                color: '#fff',
+                                weight: 2,
+                                opacity: 1,
+                                fillOpacity: 0.8
+                            }).addTo(map).bindPopup('La teva ubicació actual');
+                            
+                            showToast('Ubicació trobada', 'A punt per començar el seguiment!');
+                        },
+                        (error) => {
+                            console.log('Geolocation error:', error.code, error.message);
+                            showAlert('No es pot obtenir la teva ubicació. Assegura\'t que els serveis d\'ubicació estiguin activats.', 'warning');
+                        },
+                        {
+                            enableHighAccuracy: false,
+                            timeout: 10000,
+                            maximumAge: 0
+                        }
+                    );
+                } else {
+                    console.log('Geolocation NOT supported');
+                    showAlert('La geolocalització no està suportada pel teu navegador', 'error');
+                }
+                
+                console.log('=== initMap() completed successfully ===');
+                
+            } catch (error) {
+                console.error('CRITICAL ERROR in initMap():', error);
+                showAlert('Error crític al inicialitzar el mapa: ' + error.message, 'error');
             }
         }
         
@@ -901,12 +968,33 @@ HTML_CONTENT = '''<!DOCTYPE html>
             }, 4000);
         }
         
-        // Initialize on page load
-        document.addEventListener('DOMContentLoaded', function() {
+        // Initialize on page load with multiple fallbacks
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() {
+                console.log('=== DOMContentLoaded event fired ===');
+                console.log('GPS Tracker initialized');
+                initMap();
+                updateUI();
+            });
+        } else {
+            // DOM already loaded
+            console.log('=== DOM already loaded, initializing immediately ===');
             console.log('GPS Tracker initialized');
             initMap();
             updateUI();
+        }
+        
+        // Additional fallback: window.onload
+        window.addEventListener('load', function() {
+            console.log('=== window.load event fired ===');
+            // Only init if map hasn't been created yet
+            if (!map) {
+                console.log('Map not yet initialized, trying again...');
+                initMap();
+            }
         });
+        
+        console.log('=== DIAGNOSTIC END ===');
     </script>
 </body>
 </html>'''
