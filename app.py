@@ -2,8 +2,11 @@ from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from datetime import datetime
 import io
+import base64
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from PIL import Image
 import uuid
 import os
 
@@ -13,9 +16,9 @@ CORS(app)
 # Store tracks in memory
 tracks = {}
 
-# Enhanced HTML with beautiful design and robust GPS tracking
+# Enhanced HTML with map screenshot capture
 HTML_CONTENT = '''<!DOCTYPE html>
-<html lang="ca">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -132,17 +135,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
             box-shadow: 0 6px 25px rgba(17, 153, 142, 0.4);
         }
         
-        .btn-pause {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            color: white;
-        }
-        
-        .btn-pause:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 25px rgba(240, 147, 251, 0.4);
-        }
-        
-        
         .btn-stop {
             background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
             color: white;
@@ -202,11 +194,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
         .status-value.inactive {
             color: #eb3349;
         }
-        
-        .status-value.paused {
-            color: #f5576c;
-        }
-        
         
         #map {
             flex: 1;
@@ -275,31 +262,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
             }
         }
         
-        .tracking-indicator.paused {
-            background: #f5576c;
-            animation: blink 1s infinite;
-            box-shadow: 0 0 15px rgba(245, 87, 108, 0.8);
-        }
-        
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-        
-        
-        /* Custom Leaflet styles */
-        .leaflet-popup-content-wrapper {
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-        }
-        
-        .leaflet-popup-content {
-            font-family: 'Inter', sans-serif;
-            font-size: 14px;
-            margin: 15px;
-        }
-        
-        /* Loading spinner */
         .spinner {
             display: inline-block;
             width: 14px;
@@ -314,7 +276,17 @@ HTML_CONTENT = '''<!DOCTYPE html>
             to { transform: rotate(360deg); }
         }
         
-        /* Mobile responsive */
+        .leaflet-popup-content-wrapper {
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+        }
+        
+        .leaflet-popup-content {
+            font-family: 'Inter', sans-serif;
+            font-size: 14px;
+            margin: 15px;
+        }
+        
         @media (max-width: 768px) {
             .header {
                 padding: 15px 20px;
@@ -351,7 +323,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
             }
         }
         
-        /* Toast notifications */
         .toast {
             position: fixed;
             bottom: 30px;
@@ -395,7 +366,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
         </div>
         
         <div class="alert alert-warning" id="alertBanner">
-            <span id="alertMessage">📍 Please allow location access to start tracking your route.</span>
+            <span id="alertMessage">📍 Please allow location access to begin tracking.</span>
         </div>
         
         <div class="controls">
@@ -405,11 +376,11 @@ HTML_CONTENT = '''<!DOCTYPE html>
             </button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopTracking()" disabled>
                 <span class="btn-icon">⏹</span>
-                <span>Finish</span>
+                <span>Stop Tracking</span>
             </button>
             <button class="btn btn-download" id="downloadBtn" onclick="downloadPDF()" disabled>
                 <span class="btn-icon">⬇</span>
-                <span>Download PDF</span>
+                <span id="downloadBtnText">Download PDF</span>
             </button>
             
             <div class="status">
@@ -444,27 +415,31 @@ HTML_CONTENT = '''<!DOCTYPE html>
     </div>
     
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script>
-        let map, trackId = null, isTracking = false, isPaused = false, watchId = null;
+        // Global variables
+        let map, trackId = null, isTracking = false, watchId = null;
         let routePolyline = null, currentMarker = null, routePoints = [], totalDistance = 0;
         let startMarker = null, trackingStartTime = null, durationInterval = null;
-        let pausedTime = 0, pauseStartTime = null;
         
         // Initialize map
         function initMap() {
+            console.log('Initializing map...');
             map = L.map('map').setView([20, 0], 2);
             
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contribuïdors',
+                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
                 maxZoom: 19
             }).addTo(map);
             
             // Try to get initial position
             if (navigator.geolocation) {
+                console.log('Geolocation is supported');
                 navigator.geolocation.getCurrentPosition(
                     (position) => {
                         const lat = position.coords.latitude;
                         const lon = position.coords.longitude;
+                        console.log('Initial position:', lat, lon);
                         map.setView([lat, lon], 15);
                         
                         // Add marker for current location
@@ -477,15 +452,16 @@ HTML_CONTENT = '''<!DOCTYPE html>
                             fillOpacity: 0.8
                         }).addTo(map).bindPopup('Your current location');
                         
-                        showToast("Ubicació trobada", "A punt per començar el seguiment!");
+                        showToast('Location Found', 'Ready to start tracking!');
                     },
                     (error) => {
                         console.log('Initial position error:', error);
-                        showAlert("No es pot obtenir la teva ubicació. Assegura't que els serveis d'ubicació estiguin activats.", 'warning');
+                        showAlert('Unable to get your location. Make sure location services are enabled.', 'warning');
                     }
                 );
             } else {
-                showAlert("La geolocalització no està suportada pel teu navegador", 'error');
+                console.log('Geolocation not supported');
+                showAlert('Geolocation is not supported by your browser', 'error');
             }
         }
         
@@ -506,7 +482,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             if (!trackingStartTime) return;
             
             const now = Date.now();
-            const elapsed = Math.floor((now - trackingStartTime - pausedTime) / 1000);
+            const elapsed = Math.floor((now - trackingStartTime) / 1000);
             const minutes = Math.floor(elapsed / 60);
             const seconds = elapsed % 60;
             
@@ -514,50 +490,76 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
         }
         
+        // Capture map as image
+        async function captureMapImage() {
+            try {
+                console.log('Capturing map image...');
+                const mapElement = document.getElementById('map');
+                
+                // Use html2canvas to capture the map
+                const canvas = await html2canvas(mapElement, {
+                    useCORS: true,
+                    allowTaint: true,
+                    backgroundColor: '#f0f0f0',
+                    scale: 2 // Higher quality
+                });
+                
+                // Convert to base64
+                const imageData = canvas.toDataURL('image/png');
+                console.log('Map image captured successfully');
+                
+                return imageData;
+            } catch (error) {
+                console.error('Error capturing map:', error);
+                return null;
+            }
+        }
+        
         // Start tracking
         async function startTracking() {
             if (!navigator.geolocation) {
-                showAlert("La geolocalització no està suportada pel teu navegador", 'error');
+                showAlert('Geolocation is not supported by your browser', 'error');
                 return;
             }
             
             const startBtn = document.getElementById('startBtn');
             const startBtnText = document.getElementById('startBtnText');
             startBtn.disabled = true;
-            startBtnText.innerHTML = '<span class="spinner"></span> Inicialitzant...';
+            startBtnText.innerHTML = '<span class="spinner"></span> Initializing...';
             
-            showAlert("Sol·licitant permís d'ubicació...", 'warning');
+            showAlert('Requesting location permission...', 'warning');
             
             try {
                 // Request permission first
                 const permissionResult = await navigator.permissions.query({ name: 'geolocation' });
                 
                 if (permissionResult.state === 'denied') {
-                    showAlert("Permís d'ubicació denegat. Si us plau, activa l'accés a la ubicació a la configuració del navegador.", 'error');
+                    showAlert('Location permission denied. Please enable location access in your browser settings.', 'error');
                     startBtn.disabled = false;
-                    startBtnText.textContent = "Iniciar";
+                    startBtnText.textContent = 'Start Tracking';
                     return;
                 }
                 
-                // Start tracking session
+                // Start tracking session on backend
                 const response = await fetch('/api/track/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
                 
                 if (!response.ok) {
-                    throw new Error('Failed to start tracking session');
+                    throw new Error('Failed to start tracking');
                 }
                 
                 const data = await response.json();
                 trackId = data.track_id;
+                console.log('Track started with ID:', trackId);
                 
                 // Reset state
                 routePoints = [];
                 totalDistance = 0;
-                pausedTime = 0;
                 trackingStartTime = Date.now();
                 
+                // Clear existing markers and polylines
                 if (routePolyline) map.removeLayer(routePolyline);
                 if (startMarker) map.removeLayer(startMarker);
                 if (currentMarker) map.removeLayer(currentMarker);
@@ -574,59 +576,24 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 );
                 
                 isTracking = true;
-                isPaused = false;
                 updateUI();
                 
                 // Start duration timer
                 durationInterval = setInterval(updateDuration, 1000);
                 
                 hideAlert();
-                showToast("Seguiment iniciat", "La teva ruta s'està enregistrant!");
+                showToast('Tracking Started', 'Your route is being recorded!');
                 
             } catch (error) {
                 console.error('Error starting track:', error);
-                showAlert("Error al iniciar el seguiment. Si us plau, torna-ho a provar.", 'error');
+                showAlert('Failed to start tracking. Please try again.', 'error');
                 startBtn.disabled = false;
-                startBtnText.textContent = "Iniciar";
+                startBtnText.textContent = 'Start Tracking';
             }
-        }
-        
-        // Toggle pause
-        function togglePause() {
-            if (!isTracking) return;
-            
-            isPaused = !isPaused;
-            
-            const pauseIcon = document.getElementById("pauseIcon");
-            const pauseBtnText = document.getElementById("pauseBtnText");
-            
-            if (isPaused) {
-                pauseStartTime = Date.now();
-                pauseIcon.textContent = "▶";
-                pauseBtnText.textContent = "Reprendre";
-                showToast("Seguiment pausat", "Prem Reprendre per continuar");
-                console.log("Tracking paused");
-            } else {
-                if (pauseStartTime) {
-                    pausedTime += (Date.now() - pauseStartTime);
-                    pauseStartTime = null;
-                }
-                pauseIcon.textContent = "⏸";
-                pauseBtnText.textContent = "Pausar";
-                showToast("Seguiment reprès", "La ruta continua enregistrant-se");
-                console.log("Tracking resumed");
-            }
-            
-            updateUI();
         }
         
         // Handle position update
         async function handlePosition(position) {
-            if (isPaused) {
-                console.log("Position update ignored (paused)");
-                return; // Don't record points while paused
-            }
-            
             const lat = position.coords.latitude;
             const lon = position.coords.longitude;
             const accuracy = position.coords.accuracy;
@@ -647,7 +614,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 });
                 
                 if (!response.ok) {
-                    throw new Error('Failed to save point');
+                    throw new Error('Failed to add point');
                 }
                 
                 const newPoint = [lat, lon];
@@ -670,7 +637,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     const lastPoint = routePoints[routePoints.length - 1];
                     const distance = calculateDistance(lastPoint[0], lastPoint[1], lat, lon);
                     
-                    // Only add point if movement is significant (more than 5 meters)
+                    // Only add significant movement (more than 5 meters)
                     if (distance > 0.005 || routePoints.length === 1) {
                         totalDistance += distance;
                     }
@@ -722,41 +689,39 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 
                 // Update UI
                 document.getElementById('pointCount').textContent = routePoints.length;
-                document.getElementById('distance').textContent = totalDistance.toFixed(2).replace('.', ',') + ' km';
+                document.getElementById('distance').textContent = totalDistance.toFixed(2) + ' km';
                 
             } catch (error) {
                 console.error('Error adding point:', error);
-                showToast('Warning', 'Failed to save location point', 'warning');
             }
         }
         
         // Handle geolocation error
         function handleError(error) {
             console.error('Geolocation error:', error);
-            let message = "Error obtenint la ubicació: ";
+            let message = 'Error getting location: ';
             
             switch(error.code) {
                 case error.PERMISSION_DENIED:
-                    message = "Permís d'ubicació denegat. Si us plau, activa l'accés a la ubicació a la configuració del navegador.";
+                    message = 'User denied the request for Geolocation.';
                     showAlert(message, 'error');
                     stopTracking();
                     break;
                 case error.POSITION_UNAVAILABLE:
-                    message = 'Position unavailable. Please check your GPS signal.';
-                    showToast('GPS Error', message, 'warning');
+                    message = 'Location information is unavailable.';
                     break;
                 case error.TIMEOUT:
-                    message = 'Location request timed out. Retrying...';
-                    console.log(message);
+                    message = 'The request to get user location timed out.';
                     break;
                 default:
-                    message = 'Unknown error occurred while getting location.';
-                    showToast('Error', message, 'error');
+                    message = 'An unknown error occurred.';
             }
         }
         
         // Stop tracking
         async function stopTracking() {
+            console.log('Stopping tracking...');
+            
             if (watchId) {
                 navigator.geolocation.clearWatch(watchId);
                 watchId = null;
@@ -769,43 +734,48 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             if (trackId) {
                 try {
-                    const response = await fetch(`/api/track/${trackId}/finish`, {
+                    // Capture the map image BEFORE finishing
+                    showToast('Saving Route', 'Capturing map image...');
+                    const mapImage = await captureMapImage();
+                    
+                    // Send finish request with map image
+                    await fetch(`/api/track/${trackId}/finish`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            total_distance: totalDistance,
+                            map_image: mapImage
+                        })
                     });
                     
-                    if (!response.ok) {
-                        throw new Error('Failed to finish tracking');
-                    }
-                    
-                    showToast('Tracking Finished', `Total distance: ${totalDistance.toFixed(2)} km`);
+                    showToast('Tracking Stopped', `Total distance: ${totalDistance.toFixed(2)} km`);
                     
                 } catch (error) {
                     console.error('Error finishing track:', error);
-                    showToast('Warning', 'Failed to save final track data', 'warning');
+                    showToast('Warning', 'Failed to stop tracking. Please try again.', 'warning');
                 }
             }
             
             isTracking = false;
-            isPaused = false;
             updateUI();
         }
         
         // Download PDF
         async function downloadPDF() {
             if (!trackId) {
-                showAlert("No hi ha cap ruta disponible per descarregar", 'error');
+                showAlert('No track available to download', 'error');
                 return;
             }
             
             const downloadBtn = document.getElementById('downloadBtn');
+            const downloadBtnText = document.getElementById('downloadBtnText');
             const originalText = downloadBtn.innerHTML;
-            downloadBtn.innerHTML = '<span class="spinner"></span> Generating PDF...';
+            downloadBtn.innerHTML = '<span class="btn-icon">⬇</span><span class="spinner"></span> Generating PDF...';
             downloadBtn.disabled = true;
             
             try {
                 window.location.href = `/api/track/${trackId}/pdf`;
-                showToast("Èxit", "Descàrrega del PDF iniciada!");
+                showToast('Success', 'PDF download started!');
                 
                 setTimeout(() => {
                     downloadBtn.innerHTML = originalText;
@@ -814,7 +784,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 
             } catch (error) {
                 console.error('Error downloading PDF:', error);
-                showAlert("Error al descarregar el PDF. Si us plau, torna-ho a provar.", 'error');
+                showAlert('Failed to download PDF. Please try again.', 'error');
                 downloadBtn.innerHTML = originalText;
                 downloadBtn.disabled = false;
             }
@@ -830,17 +800,17 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             if (isTracking) {
                 startBtn.disabled = true;
-                startBtnText.textContent = "Enregistrant...";
                 stopBtn.disabled = false;
                 downloadBtn.disabled = true;
+                startBtnText.textContent = 'Tracking...';
                 statusText.innerHTML = '<span class="tracking-indicator active"></span>Tracking';
                 statusText.className = 'status-value active';
             } else {
                 startBtn.disabled = false;
-                startBtnText.textContent = "Iniciar";
+                startBtnText.textContent = 'Start Tracking';
                 stopBtn.disabled = true;
                 downloadBtn.disabled = trackId === null;
-                statusText.innerHTML = '<span class="tracking-indicator"></span>' + (trackId ? 'Finished' : 'Inactive');
+                statusText.innerHTML = '<span class="tracking-indicator"></span>' + (trackId ? 'Stopped' : 'Inactive');
                 statusText.className = 'status-value ' + (trackId ? 'active' : 'inactive');
             }
         }
@@ -861,7 +831,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
         }
         
         // Show toast notification
-        function showToast(title, message, type = 'success') {
+        function showToast(title, message) {
             const toast = document.getElementById('toast');
             const toastTitle = document.getElementById('toastTitle');
             const toastMessage = document.getElementById('toastMessage');
@@ -898,7 +868,8 @@ def start_track():
         'id': track_id,
         'started_at': datetime.now().isoformat(),
         'points': [],
-        'finished': False
+        'finished': False,
+        'map_image': None
     }
     return jsonify({'track_id': track_id, 'status': 'started'})
 
@@ -921,18 +892,21 @@ def add_point(track_id):
 
 @app.route('/api/track/<track_id>/finish', methods=['POST'])
 def finish_track(track_id):
-    """Finish tracking"""
+    """Finish tracking and save map image"""
     if track_id not in tracks:
         return jsonify({'error': 'Track not found'}), 404
     
+    data = request.json
     tracks[track_id]['finished'] = True
     tracks[track_id]['finished_at'] = datetime.now().isoformat()
+    tracks[track_id]['total_distance'] = data.get('total_distance', 0)
+    tracks[track_id]['map_image'] = data.get('map_image', None)
     
     return jsonify({'status': 'finished', 'track_id': track_id})
 
 @app.route('/api/track/<track_id>/pdf', methods=['GET'])
 def generate_pdf(track_id):
-    """Generate PDF with the route map"""
+    """Generate PDF with the route map image"""
     if track_id not in tracks:
         return jsonify({'error': 'Track not found'}), 404
     
@@ -947,7 +921,7 @@ def generate_pdf(track_id):
     
     # Add title
     c.setFont("Helvetica-Bold", 24)
-    c.drawString(50, height - 60, "Rastrejador de Rutes GPS")
+    c.drawString(50, height - 60, "GPS Route Tracker")
     
     # Add metadata
     c.setFont("Helvetica", 12)
@@ -962,41 +936,48 @@ def generate_pdf(track_id):
     center_lat = (min(lats) + max(lats)) / 2
     center_lon = (min(lons) + max(lons)) / 2
     
-    # Calculate total distance
-    total_distance = 0
-    for i in range(1, len(track['points'])):
-        p1 = track['points'][i-1]
-        p2 = track['points'][i]
-        # Haversine formula
-        R = 6371
-        dLat = (p2['lat'] - p1['lat']) * 3.14159 / 180
-        dLon = (p2['lon'] - p1['lon']) * 3.14159 / 180
-        a = (0.5 - 0.5 * ((1 - dLat * dLat / 2) * (1 - dLat * dLat / 2))) + \
-            (1 - p1['lat'] * p1['lat'] * 3.14159 * 3.14159 / 32400) * \
-            (1 - p2['lat'] * p2['lat'] * 3.14159 * 3.14159 / 32400) * \
-            (0.5 - 0.5 * ((1 - dLon * dLon / 2) * (1 - dLon * dLon / 2)))
-        total_distance += 2 * R * (0.7071 if a < 0 else (1.4142 * (a ** 0.5) if a > 1 else 2 * (a ** 0.5)))
+    total_distance = track.get('total_distance', 0)
     
     c.drawString(50, height - 180, f"Center: {center_lat:.6f}, {center_lon:.6f}")
     c.drawString(50, height - 200, f"Total Distance: {total_distance:.2f} km")
     
-    # Add route coordinates header
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, height - 240, "Route Coordinates:")
+    # Add route map image if available
+    if track.get('map_image'):
+        try:
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(50, height - 240, "Route Map:")
+            
+            # Decode base64 image
+            image_data = track['map_image'].split(',')[1]  # Remove data:image/png;base64,
+            image_bytes = base64.b64decode(image_data)
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Save to temporary buffer for ReportLab
+            img_buffer = io.BytesIO()
+            image.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            
+            # Add image to PDF (scaled to fit)
+            img_reader = ImageReader(img_buffer)
+            img_width = 480
+            img_height = 320
+            
+            c.drawImage(img_reader, 60, height - 600, width=img_width, height=img_height, 
+                       preserveAspectRatio=True, mask='auto')
+            
+            # Add caption
+            c.setFont("Helvetica", 9)
+            c.drawString(60, height - 615, "Tracked route with colored path")
+            
+        except Exception as e:
+            print(f"Error adding map image to PDF: {e}")
+            c.setFont("Helvetica", 10)
+            c.drawString(50, height - 260, "Map image not available")
+    else:
+        c.setFont("Helvetica", 10)
+        c.drawString(50, height - 240, "Map image not captured")
     
-    # Add coordinates
-    c.setFont("Helvetica", 9)
-    y_pos = height - 260
-    for i, point in enumerate(track['points'][:15]):
-        c.drawString(60, y_pos, f"{i+1}. Lat: {point['lat']:.6f}, Lon: {point['lon']:.6f}")
-        y_pos -= 15
-        if y_pos < 100:
-            break
-    
-    if len(track['points']) > 15:
-        c.drawString(60, y_pos - 10, f"... and {len(track['points']) - 15} more points")
-    
-    # Add footer
+    # Add footer with OpenStreetMap link
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(50, 60, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     c.drawString(50, 45, "Powered by OpenStreetMap")
