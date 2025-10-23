@@ -16,7 +16,7 @@ CORS(app)
 # Store tracks in memory
 tracks = {}
 
-# Enhanced HTML with map screenshot capture
+# Enhanced HTML with gap detection and visual indicators
 HTML_CONTENT = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -195,6 +195,10 @@ HTML_CONTENT = '''<!DOCTYPE html>
             color: #eb3349;
         }
         
+        .status-value.warning {
+            color: #f5576c;
+        }
+        
         #map {
             flex: 1;
             min-height: 400px;
@@ -287,6 +291,50 @@ HTML_CONTENT = '''<!DOCTYPE html>
             margin: 15px;
         }
         
+        .legend {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            z-index: 1000;
+            font-size: 12px;
+            display: none;
+        }
+        
+        .legend.show {
+            display: block;
+        }
+        
+        .legend-title {
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        
+        .legend-line {
+            width: 30px;
+            height: 3px;
+        }
+        
+        .legend-line.solid {
+            background: #667eea;
+        }
+        
+        .legend-line.dashed {
+            background: linear-gradient(to right, #ff6b6b 50%, transparent 50%);
+            background-size: 8px 3px;
+        }
+        
         @media (max-width: 768px) {
             .header {
                 padding: 15px 20px;
@@ -320,6 +368,12 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 width: 100%;
                 justify-content: center;
                 padding: 16px 28px;
+            }
+            
+            .legend {
+                bottom: 10px;
+                right: 10px;
+                font-size: 11px;
             }
         }
         
@@ -400,6 +454,10 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     <span class="status-value" id="distance">0.00 km</span>
                 </div>
                 <div class="status-item">
+                    <span class="status-label">Gaps</span>
+                    <span class="status-value warning" id="gapCount">0</span>
+                </div>
+                <div class="status-item">
                     <span class="status-label">Duration</span>
                     <span class="status-value" id="duration">00:00</span>
                 </div>
@@ -407,6 +465,18 @@ HTML_CONTENT = '''<!DOCTYPE html>
         </div>
         
         <div id="map"></div>
+        
+        <div class="legend" id="legend">
+            <div class="legend-title">Route Legend</div>
+            <div class="legend-item">
+                <div class="legend-line solid"></div>
+                <span>Good GPS Signal</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-line dashed"></div>
+                <span>Signal Gap / Phone Locked</span>
+            </div>
+        </div>
     </div>
     
     <div class="toast" id="toast">
@@ -419,8 +489,14 @@ HTML_CONTENT = '''<!DOCTYPE html>
     <script>
         // Global variables
         let map, trackId = null, isTracking = false, watchId = null;
-        let routePolyline = null, currentMarker = null, routePoints = [], totalDistance = 0;
+        let routePolylines = [], currentMarker = null, routeSegments = [], totalDistance = 0;
         let startMarker = null, trackingStartTime = null, durationInterval = null;
+        let lastPointTime = null, lastPointData = null;
+        let gapCount = 0;
+        
+        // Gap detection thresholds
+        const GAP_TIME_THRESHOLD = 30; // seconds - if more than 30s between points, it's a gap
+        const GAP_DISTANCE_THRESHOLD = 0.2; // km - if more than 200m between points, it's a gap
         
         // Initialize map
         function initMap() {
@@ -442,7 +518,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
                         console.log('Initial position:', lat, lon);
                         map.setView([lat, lon], 15);
                         
-                        // Add marker for current location
                         L.circleMarker([lat, lon], {
                             radius: 8,
                             fillColor: '#667eea',
@@ -460,14 +535,13 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     }
                 );
             } else {
-                console.log('Geolocation not supported');
                 showAlert('Geolocation is not supported by your browser', 'error');
             }
         }
         
         // Calculate distance between two points (Haversine formula)
         function calculateDistance(lat1, lon1, lat2, lon2) {
-            const R = 6371; // Earth's radius in km
+            const R = 6371;
             const dLat = (lat2 - lat1) * Math.PI / 180;
             const dLon = (lon2 - lon1) * Math.PI / 180;
             const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
@@ -490,21 +564,42 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
         }
         
+        // Fit map to show entire route
+        function fitMapToRoute() {
+            if (routeSegments.length === 0) return;
+            
+            const allPoints = [];
+            routeSegments.forEach(segment => {
+                segment.points.forEach(point => {
+                    allPoints.push(point);
+                });
+            });
+            
+            if (allPoints.length > 0) {
+                const bounds = L.latLngBounds(allPoints);
+                map.fitBounds(bounds, { padding: [50, 50] });
+            }
+        }
+        
         // Capture map as image
         async function captureMapImage() {
             try {
+                console.log('Fitting map to route...');
+                fitMapToRoute();
+                
+                // Wait for tiles to load
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
                 console.log('Capturing map image...');
                 const mapElement = document.getElementById('map');
                 
-                // Use html2canvas to capture the map
                 const canvas = await html2canvas(mapElement, {
                     useCORS: true,
                     allowTaint: true,
                     backgroundColor: '#f0f0f0',
-                    scale: 2 // Higher quality
+                    scale: 2
                 });
                 
-                // Convert to base64
                 const imageData = canvas.toDataURL('image/png');
                 console.log('Map image captured successfully');
                 
@@ -530,7 +625,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
             showAlert('Requesting location permission...', 'warning');
             
             try {
-                // Request permission first
                 const permissionResult = await navigator.permissions.query({ name: 'geolocation' });
                 
                 if (permissionResult.state === 'denied') {
@@ -540,7 +634,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     return;
                 }
                 
-                // Start tracking session on backend
                 const response = await fetch('/api/track/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
@@ -555,16 +648,20 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 console.log('Track started with ID:', trackId);
                 
                 // Reset state
-                routePoints = [];
+                routeSegments = [];
                 totalDistance = 0;
+                gapCount = 0;
                 trackingStartTime = Date.now();
+                lastPointTime = null;
+                lastPointData = null;
                 
                 // Clear existing markers and polylines
-                if (routePolyline) map.removeLayer(routePolyline);
+                routePolylines.forEach(line => map.removeLayer(line));
+                routePolylines = [];
                 if (startMarker) map.removeLayer(startMarker);
                 if (currentMarker) map.removeLayer(currentMarker);
                 
-                // Start watching position with high accuracy
+                // Start watching position
                 watchId = navigator.geolocation.watchPosition(
                     handlePosition,
                     handleError,
@@ -581,8 +678,11 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 // Start duration timer
                 durationInterval = setInterval(updateDuration, 1000);
                 
+                // Show legend
+                document.getElementById('legend').classList.add('show');
+                
                 hideAlert();
-                showToast('Tracking Started', 'Your route is being recorded!');
+                showToast('Tracking Started', 'Your route is being recorded! Keep screen on for best results.');
                 
             } catch (error) {
                 console.error('Error starting track:', error);
@@ -592,17 +692,18 @@ HTML_CONTENT = '''<!DOCTYPE html>
             }
         }
         
-        // Handle position update
+        // Handle position update with gap detection
         async function handlePosition(position) {
             const lat = position.coords.latitude;
             const lon = position.coords.longitude;
             const accuracy = position.coords.accuracy;
+            const currentTime = Date.now();
             
             console.log(`Position update: ${lat}, ${lon} (accuracy: ${accuracy}m)`);
             
             try {
                 // Send point to backend
-                const response = await fetch(`/api/track/${trackId}/point`, {
+                await fetch(`/api/track/${trackId}/point`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -613,14 +714,29 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     })
                 });
                 
-                if (!response.ok) {
-                    throw new Error('Failed to add point');
+                const newPoint = [lat, lon];
+                let isGap = false;
+                
+                // Check for gap if we have a previous point
+                if (lastPointTime && lastPointData) {
+                    const timeDiff = (currentTime - lastPointTime) / 1000; // seconds
+                    const distance = calculateDistance(
+                        lastPointData[0], lastPointData[1], 
+                        lat, lon
+                    );
+                    
+                    // Detect gap: either too much time OR too much distance
+                    if (timeDiff > GAP_TIME_THRESHOLD || distance > GAP_DISTANCE_THRESHOLD) {
+                        isGap = true;
+                        gapCount++;
+                        console.log(`GAP DETECTED: ${timeDiff.toFixed(0)}s, ${(distance*1000).toFixed(0)}m`);
+                        showToast('GPS Gap Detected', 
+                            `Phone locked or signal lost for ${timeDiff.toFixed(0)}s. Marking as uncertain.`);
+                    }
                 }
                 
-                const newPoint = [lat, lon];
-                
                 // Add start marker on first point
-                if (routePoints.length === 0) {
+                if (routeSegments.length === 0) {
                     startMarker = L.marker([lat, lon], {
                         icon: L.divIcon({
                             className: 'start-marker',
@@ -630,32 +746,74 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     }).addTo(map);
                     
                     map.setView([lat, lon], 16);
-                }
-                
-                // Calculate distance if we have a previous point
-                if (routePoints.length > 0) {
-                    const lastPoint = routePoints[routePoints.length - 1];
-                    const distance = calculateDistance(lastPoint[0], lastPoint[1], lat, lon);
                     
-                    // Only add significant movement (more than 5 meters)
-                    if (distance > 0.005 || routePoints.length === 1) {
-                        totalDistance += distance;
+                    // Start first segment
+                    routeSegments.push({
+                        points: [newPoint],
+                        isGap: false
+                    });
+                } else {
+                    // Check if we need to start a new segment (gap) or continue current one
+                    const currentSegment = routeSegments[routeSegments.length - 1];
+                    
+                    if (isGap) {
+                        // Create a gap segment
+                        routeSegments.push({
+                            points: [lastPointData, newPoint],
+                            isGap: true
+                        });
+                        // Start new good segment
+                        routeSegments.push({
+                            points: [newPoint],
+                            isGap: false
+                        });
+                    } else {
+                        // Continue current segment
+                        if (currentSegment.isGap) {
+                            // If last segment was a gap, start new good segment
+                            routeSegments.push({
+                                points: [newPoint],
+                                isGap: false
+                            });
+                        } else {
+                            // Continue good segment
+                            currentSegment.points.push(newPoint);
+                        }
+                    }
+                    
+                    // Calculate distance
+                    if (lastPointData) {
+                        const distance = calculateDistance(
+                            lastPointData[0], lastPointData[1], 
+                            lat, lon
+                        );
+                        if (distance > 0.005) { // More than 5 meters
+                            totalDistance += distance;
+                        }
                     }
                 }
                 
-                routePoints.push(newPoint);
+                // Redraw all segments
+                routePolylines.forEach(line => map.removeLayer(line));
+                routePolylines = [];
                 
-                // Update polyline
-                if (routePolyline) {
-                    map.removeLayer(routePolyline);
-                }
-                
-                routePolyline = L.polyline(routePoints, {
-                    color: '#667eea',
-                    weight: 5,
-                    opacity: 0.8,
-                    smoothFactor: 1
-                }).addTo(map);
+                routeSegments.forEach(segment => {
+                    if (segment.points.length > 1) {
+                        const polyline = L.polyline(segment.points, {
+                            color: segment.isGap ? '#ff6b6b' : '#667eea',
+                            weight: 5,
+                            opacity: segment.isGap ? 0.6 : 0.8,
+                            dashArray: segment.isGap ? '10, 10' : null,
+                            smoothFactor: 1
+                        }).addTo(map);
+                        
+                        if (segment.isGap) {
+                            polyline.bindPopup('⚠️ GPS signal gap - phone may have been locked');
+                        }
+                        
+                        routePolylines.push(polyline);
+                    }
+                });
                 
                 // Update current position marker
                 if (currentMarker) {
@@ -681,15 +839,21 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     opacity: 0.3
                 }).addTo(map);
                 
-                // Center map on current position (with smooth pan)
+                // Center map on current position
                 map.panTo([lat, lon], {
                     animate: true,
                     duration: 0.5
                 });
                 
                 // Update UI
-                document.getElementById('pointCount').textContent = routePoints.length;
+                const totalPoints = routeSegments.reduce((sum, seg) => sum + seg.points.length, 0);
+                document.getElementById('pointCount').textContent = totalPoints;
                 document.getElementById('distance').textContent = totalDistance.toFixed(2) + ' km';
+                document.getElementById('gapCount').textContent = gapCount;
+                
+                // Update last point data
+                lastPointTime = currentTime;
+                lastPointData = newPoint;
                 
             } catch (error) {
                 console.error('Error adding point:', error);
@@ -699,22 +863,18 @@ HTML_CONTENT = '''<!DOCTYPE html>
         // Handle geolocation error
         function handleError(error) {
             console.error('Geolocation error:', error);
-            let message = 'Error getting location: ';
             
             switch(error.code) {
                 case error.PERMISSION_DENIED:
-                    message = 'User denied the request for Geolocation.';
-                    showAlert(message, 'error');
+                    showAlert('Location permission denied. Please enable location access.', 'error');
                     stopTracking();
                     break;
                 case error.POSITION_UNAVAILABLE:
-                    message = 'Location information is unavailable.';
+                    console.log('Position unavailable');
                     break;
                 case error.TIMEOUT:
-                    message = 'The request to get user location timed out.';
+                    console.log('Position timeout');
                     break;
-                default:
-                    message = 'An unknown error occurred.';
             }
         }
         
@@ -734,25 +894,25 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             if (trackId) {
                 try {
-                    // Capture the map image BEFORE finishing
                     showToast('Saving Route', 'Capturing map image...');
                     const mapImage = await captureMapImage();
                     
-                    // Send finish request with map image
                     await fetch(`/api/track/${trackId}/finish`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             total_distance: totalDistance,
+                            gap_count: gapCount,
+                            segments: routeSegments.length,
                             map_image: mapImage
                         })
                     });
                     
-                    showToast('Tracking Stopped', `Total distance: ${totalDistance.toFixed(2)} km`);
+                    const gapWarning = gapCount > 0 ? ` (${gapCount} gap${gapCount > 1 ? 's' : ''} detected)` : '';
+                    showToast('Tracking Stopped', `Distance: ${totalDistance.toFixed(2)} km${gapWarning}`);
                     
                 } catch (error) {
                     console.error('Error finishing track:', error);
-                    showToast('Warning', 'Failed to stop tracking. Please try again.', 'warning');
                 }
             }
             
@@ -768,7 +928,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
             }
             
             const downloadBtn = document.getElementById('downloadBtn');
-            const downloadBtnText = document.getElementById('downloadBtnText');
             const originalText = downloadBtn.innerHTML;
             downloadBtn.innerHTML = '<span class="btn-icon">⬇</span><span class="spinner"></span> Generating PDF...';
             downloadBtn.disabled = true;
@@ -812,6 +971,11 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 downloadBtn.disabled = trackId === null;
                 statusText.innerHTML = '<span class="tracking-indicator"></span>' + (trackId ? 'Stopped' : 'Inactive');
                 statusText.className = 'status-value ' + (trackId ? 'active' : 'inactive');
+                
+                // Hide legend when not tracking
+                if (!isTracking) {
+                    document.getElementById('legend').classList.remove('show');
+                }
             }
         }
         
@@ -842,12 +1006,12 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             setTimeout(() => {
                 toast.classList.remove('show');
-            }, 4000);
+            }, 5000);
         }
         
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
-            console.log('GPS Tracker initialized');
+            console.log('GPS Tracker initialized with gap detection');
             initMap();
             updateUI();
         });
@@ -869,7 +1033,8 @@ def start_track():
         'started_at': datetime.now().isoformat(),
         'points': [],
         'finished': False,
-        'map_image': None
+        'map_image': None,
+        'gap_count': 0
     }
     return jsonify({'track_id': track_id, 'status': 'started'})
 
@@ -900,6 +1065,8 @@ def finish_track(track_id):
     tracks[track_id]['finished'] = True
     tracks[track_id]['finished_at'] = datetime.now().isoformat()
     tracks[track_id]['total_distance'] = data.get('total_distance', 0)
+    tracks[track_id]['gap_count'] = data.get('gap_count', 0)
+    tracks[track_id]['segments'] = data.get('segments', 0)
     tracks[track_id]['map_image'] = data.get('map_image', None)
     
     return jsonify({'status': 'finished', 'track_id': track_id})
@@ -937,51 +1104,63 @@ def generate_pdf(track_id):
     center_lon = (min(lons) + max(lons)) / 2
     
     total_distance = track.get('total_distance', 0)
+    gap_count = track.get('gap_count', 0)
     
-    c.drawString(50, height - 180, f"Center: {center_lat:.6f}, {center_lon:.6f}")
-    c.drawString(50, height - 200, f"Total Distance: {total_distance:.2f} km")
+    c.drawString(50, height - 180, f"Total Distance: {total_distance:.2f} km")
+    c.drawString(50, height - 200, f"GPS Signal Gaps: {gap_count}")
+    
+    # Add gap warning if applicable
+    if gap_count > 0:
+        c.setFillColorRGB(0.8, 0.2, 0.2)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(50, height - 225, f"⚠ {gap_count} signal gap(s) detected - phone may have been locked")
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", 10)
+        c.drawString(50, height - 240, "Red dashed lines on map indicate uncertain GPS data")
     
     # Add route map image if available
     if track.get('map_image'):
         try:
             c.setFont("Helvetica-Bold", 14)
-            c.drawString(50, height - 240, "Route Map:")
+            c.drawString(50, height - 275, "Route Map:")
             
             # Decode base64 image
-            image_data = track['map_image'].split(',')[1]  # Remove data:image/png;base64,
+            image_data = track['map_image'].split(',')[1]
             image_bytes = base64.b64decode(image_data)
             image = Image.open(io.BytesIO(image_bytes))
             
-            # Save to temporary buffer for ReportLab
+            # Save to temporary buffer
             img_buffer = io.BytesIO()
             image.save(img_buffer, format='PNG')
             img_buffer.seek(0)
             
-            # Add image to PDF (scaled to fit)
+            # Add image to PDF
             img_reader = ImageReader(img_buffer)
             img_width = 480
             img_height = 320
             
-            c.drawImage(img_reader, 60, height - 600, width=img_width, height=img_height, 
+            c.drawImage(img_reader, 60, height - 635, width=img_width, height=img_height, 
                        preserveAspectRatio=True, mask='auto')
             
-            # Add caption
+            # Add legend
             c.setFont("Helvetica", 9)
-            c.drawString(60, height - 615, "Tracked route with colored path")
+            c.drawString(60, height - 650, "Blue solid line: Good GPS signal")
+            c.drawString(60, height - 665, "Red dashed line: GPS signal gap (phone locked)")
             
         except Exception as e:
             print(f"Error adding map image to PDF: {e}")
             c.setFont("Helvetica", 10)
-            c.drawString(50, height - 260, "Map image not available")
-    else:
-        c.setFont("Helvetica", 10)
-        c.drawString(50, height - 240, "Map image not captured")
+            c.drawString(50, height - 290, "Map image not available")
     
-    # Add footer with OpenStreetMap link
+    # Add footer
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(50, 60, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    c.drawString(50, 45, "Powered by OpenStreetMap")
-    c.drawString(50, 30, f"View at: https://www.openstreetmap.org/?mlat={center_lat}&mlon={center_lon}#map=15/{center_lat}/{center_lon}")
+    c.drawString(50, 80, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    c.drawString(50, 65, "Powered by OpenStreetMap")
+    c.drawString(50, 50, f"View at: https://www.openstreetmap.org/?mlat={center_lat}&mlon={center_lon}#map=15/{center_lat}/{center_lon}")
+    
+    # Add tip
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(50, 30, "Tip: Keep your phone screen unlocked while tracking for best GPS accuracy")
     
     c.save()
     buffer.seek(0)
