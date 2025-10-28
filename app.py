@@ -18,7 +18,8 @@ CORS(app)
 tracks = {}
 
 # OpenRouteService API Configuration
-OPENROUTE_API_KEY = secrets.OPENROUTE_SERVICE_KEY
+secretKeyForOpenRoute = os.getenv("OPENROUTE_SERVICE_KEY)
+OPENROUTE_API_KEY = secretKeyForOpenRoute 
 OPENROUTE_API_URL = "https://api.openrouteservice.org/v2/directions/foot-walking"
 
 # Enhanced HTML with OpenRouteService route filling
