@@ -2,14 +2,10 @@ from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from datetime import datetime
 import io
-import base64
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from PIL import Image
 import uuid
 import os
-import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -17,18 +13,13 @@ CORS(app)
 # Store tracks in memory
 tracks = {}
 
-# OpenRouteService API Configuration
-
-OPENROUTE_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjZhN2QyNmZkMDhkNDQ1YmM4NWYyZDIwYmJmYTczZGRlIiwiaCI6Im11cm11cjY0In0="
-OPENROUTE_API_URL = "https://api.openrouteservice.org/v2/directions/foot-walking"
-
-# Enhanced HTML with OpenRouteService route filling
+# Spanish UI with gap detection and GPX export
 HTML_CONTENT = '''<!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GPS Route Tracker</title>
+    <title>Rastreador de Rutas GPS</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -161,12 +152,23 @@ HTML_CONTENT = '''<!DOCTYPE html>
             box-shadow: 0 6px 25px rgba(102, 126, 234, 0.4);
         }
         
+        .btn-gpx {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        
+        .btn-gpx:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 25px rgba(240, 147, 251, 0.4);
+        }
+        
         .status {
             flex: 1;
             display: flex;
-            gap: 30px;
+            gap: 20px;
             font-size: 14px;
             min-width: 300px;
+            flex-wrap: wrap;
         }
         
         .status-item {
@@ -175,7 +177,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             padding: 10px 15px;
             background: rgba(102, 126, 234, 0.1);
             border-radius: 10px;
-            min-width: 100px;
+            min-width: 90px;
         }
         
         .status-label {
@@ -199,6 +201,10 @@ HTML_CONTENT = '''<!DOCTYPE html>
         
         .status-value.inactive {
             color: #eb3349;
+        }
+        
+        .status-value.warning {
+            color: #f5576c;
         }
         
         #map {
@@ -282,15 +288,48 @@ HTML_CONTENT = '''<!DOCTYPE html>
             to { transform: rotate(360deg); }
         }
         
-        .leaflet-popup-content-wrapper {
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+        .legend {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            z-index: 1000;
+            font-size: 12px;
+            display: none;
         }
         
-        .leaflet-popup-content {
-            font-family: 'Inter', sans-serif;
-            font-size: 14px;
-            margin: 15px;
+        .legend.show {
+            display: block;
+        }
+        
+        .legend-title {
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        
+        .legend-line {
+            width: 30px;
+            height: 3px;
+        }
+        
+        .legend-line.solid {
+            background: #667eea;
+        }
+        
+        .legend-line.dashed {
+            background: linear-gradient(to right, #ff6b6b 50%, transparent 50%);
+            background-size: 8px 3px;
         }
         
         @media (max-width: 768px) {
@@ -326,6 +365,12 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 width: 100%;
                 justify-content: center;
                 padding: 16px 28px;
+            }
+            
+            .legend {
+                bottom: 10px;
+                right: 10px;
+                font-size: 11px;
             }
         }
         
@@ -365,92 +410,110 @@ HTML_CONTENT = '''<!DOCTYPE html>
             <div class="header-content">
                 <div class="logo">🗺️</div>
                 <div class="header-text">
-                    <h1>GPS Route Tracker</h1>
-                    <p>Track your journey with smart route filling</p>
+                    <h1>Rastreador de Rutas GPS</h1>
+                    <p>Rastrea tu recorrido en tiempo real con OpenStreetMap</p>
                 </div>
             </div>
         </div>
         
         <div class="alert alert-warning" id="alertBanner">
-            <span id="alertMessage">📍 Please allow location access to begin tracking.</span>
+            <span id="alertMessage">📍 Por favor, permite el acceso a la ubicación para comenzar a rastrear.</span>
         </div>
         
         <div class="controls">
             <button class="btn btn-start" id="startBtn" onclick="startTracking()">
                 <span class="btn-icon">▶</span>
-                <span id="startBtnText">Start Tracking</span>
+                <span id="startBtnText">Iniciar Rastreo</span>
             </button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopTracking()" disabled>
                 <span class="btn-icon">⏹</span>
-                <span>Stop Tracking</span>
+                <span>Detener Rastreo</span>
             </button>
-            <button class="btn btn-download" id="downloadBtn" onclick="downloadPDF()" disabled>
-                <span class="btn-icon">⬇</span>
-                <span id="downloadBtnText">Download PDF</span>
+            <button class="btn btn-gpx" id="gpxBtn" onclick="downloadGPX()" disabled>
+                <span class="btn-icon">📍</span>
+                <span id="gpxBtnText">Descargar GPX</span>
+            </button>
+            <button class="btn btn-download" id="pdfBtn" onclick="downloadPDF()" disabled>
+                <span class="btn-icon">📄</span>
+                <span id="pdfBtnText">Descargar Informe</span>
             </button>
             
             <div class="status">
                 <div class="status-item">
-                    <span class="status-label">Status</span>
+                    <span class="status-label">Estado</span>
                     <span class="status-value inactive" id="statusText">
                         <span class="tracking-indicator" id="indicator"></span>
-                        Inactive
+                        Inactivo
                     </span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Points</span>
+                    <span class="status-label">Puntos</span>
                     <span class="status-value" id="pointCount">0</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Distance</span>
+                    <span class="status-label">Distancia</span>
                     <span class="status-value" id="distance">0.00 km</span>
                 </div>
                 <div class="status-item">
-                    <span class="status-label">Duration</span>
+                    <span class="status-label">Huecos</span>
+                    <span class="status-value warning" id="gapCount">0</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Duración</span>
                     <span class="status-value" id="duration">00:00</span>
                 </div>
             </div>
         </div>
         
         <div id="map"></div>
+        
+        <div class="legend" id="legend">
+            <div class="legend-title">Leyenda de Ruta</div>
+            <div class="legend-item">
+                <div class="legend-line solid"></div>
+                <span>Señal GPS Buena</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-line dashed"></div>
+                <span>Hueco de Señal / Teléfono Bloqueado</span>
+            </div>
+        </div>
     </div>
     
     <div class="toast" id="toast">
-        <strong id="toastTitle">Notification</strong>
+        <strong id="toastTitle">Notificación</strong>
         <p id="toastMessage"></p>
     </div>
     
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script>
         // Global variables
         let map, trackId = null, isTracking = false, watchId = null;
-        let routePolyline = null, currentMarker = null, routePoints = [], totalDistance = 0;
+        let routePolylines = [], currentMarker = null, routeSegments = [], totalDistance = 0;
         let startMarker = null, trackingStartTime = null, durationInterval = null;
         let lastPointTime = null, lastPointData = null;
+        let gapCount = 0;
         
-        // Gap detection threshold - 30 seconds or 200 meters triggers route filling
-        const GAP_TIME_THRESHOLD = 30;
-        const GAP_DISTANCE_THRESHOLD = 0.2;
+        // Gap detection thresholds
+        const GAP_TIME_THRESHOLD = 30; // segundos
+        const GAP_DISTANCE_THRESHOLD = 0.2; // km
         
         // Initialize map
         function initMap() {
-            console.log('Initializing map...');
+            console.log('Inicializando mapa...');
             map = L.map('map').setView([20, 0], 2);
             
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contribuidores',
                 maxZoom: 19
             }).addTo(map);
             
             // Try to get initial position
             if (navigator.geolocation) {
-                console.log('Geolocation is supported');
                 navigator.geolocation.getCurrentPosition(
                     (position) => {
                         const lat = position.coords.latitude;
                         const lon = position.coords.longitude;
-                        console.log('Initial position:', lat, lon);
                         map.setView([lat, lon], 15);
                         
                         L.circleMarker([lat, lon], {
@@ -460,21 +523,20 @@ HTML_CONTENT = '''<!DOCTYPE html>
                             weight: 2,
                             opacity: 1,
                             fillOpacity: 0.8
-                        }).addTo(map).bindPopup('Your current location');
+                        }).addTo(map).bindPopup('Tu ubicación actual');
                         
-                        showToast('Location Found', 'Ready to start tracking!');
+                        showToast('Ubicación Encontrada', '¡Listo para comenzar a rastrear!');
                     },
                     (error) => {
-                        console.log('Initial position error:', error);
-                        showAlert('Unable to get your location. Make sure location services are enabled.', 'warning');
+                        showAlert('No se pudo obtener tu ubicación. Asegúrate de que los servicios de ubicación estén habilitados.', 'warning');
                     }
                 );
             } else {
-                showAlert('Geolocation is not supported by your browser', 'error');
+                showAlert('La geolocalización no es compatible con tu navegador', 'error');
             }
         }
         
-        // Calculate distance between two points (Haversine formula)
+        // Calculate distance
         function calculateDistance(lat1, lon1, lat2, lon2) {
             const R = 6371;
             const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -486,7 +548,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             return R * c;
         }
         
-        // Update duration display
+        // Update duration
         function updateDuration() {
             if (!trackingStartTime) return;
             
@@ -499,135 +561,47 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
         }
         
-        // Fit map to show entire route before capture
-        function fitMapToRoute() {
-            if (routePoints.length === 0) return;
-            
-            try {
-                const bounds = L.latLngBounds(routePoints);
-                map.fitBounds(bounds, { 
-                    padding: [50, 50],
-                    maxZoom: 16
-                });
-                console.log('Map fitted to route bounds');
-            } catch (error) {
-                console.error('Error fitting map:', error);
-            }
-        }
-        
-        // Capture map as image
-        async function captureMapImage() {
-            try {
-                console.log('Fitting map to show full route...');
-                fitMapToRoute();
-                
-                // Wait for tiles to load
-                await new Promise(resolve => setTimeout(resolve, 1500));
-                
-                console.log('Capturing map image...');
-                const mapElement = document.getElementById('map');
-                
-                const canvas = await html2canvas(mapElement, {
-                    useCORS: true,
-                    allowTaint: true,
-                    backgroundColor: '#f0f0f0',
-                    scale: 2
-                });
-                
-                const imageData = canvas.toDataURL('image/png');
-                console.log('Map image captured successfully');
-                
-                return imageData;
-            } catch (error) {
-                console.error('Error capturing map:', error);
-                return null;
-            }
-        }
-        
-        // Fill route gap using backend API
-        async function fillRouteGap(fromLat, fromLon, toLat, toLon) {
-            try {
-                console.log(`Requesting route fill from [${fromLat}, ${fromLon}] to [${toLat}, ${toLon}]`);
-                showToast('Filling Route Gap', 'Getting walking directions...');
-                
-                const response = await fetch('/api/route/fill', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        start: [fromLon, fromLat],
-                        end: [toLon, toLat]
-                    })
-                });
-                
-                if (!response.ok) {
-                    console.error('Route fill failed');
-                    return null;
-                }
-                
-                const data = await response.json();
-                
-                if (data.route && data.route.length > 0) {
-                    console.log(`Route filled with ${data.route.length} points`);
-                    return data.route; // Returns array of [lat, lon]
-                }
-                
-                return null;
-            } catch (error) {
-                console.error('Error filling route:', error);
-                return null;
-            }
-        }
-        
         // Start tracking
         async function startTracking() {
             if (!navigator.geolocation) {
-                showAlert('Geolocation is not supported by your browser', 'error');
+                showAlert('La geolocalización no es compatible con tu navegador', 'error');
                 return;
             }
             
             const startBtn = document.getElementById('startBtn');
             const startBtnText = document.getElementById('startBtnText');
             startBtn.disabled = true;
-            startBtnText.innerHTML = '<span class="spinner"></span> Initializing...';
+            startBtnText.innerHTML = '<span class="spinner"></span> Inicializando...';
             
-            showAlert('Requesting location permission...', 'warning');
+            showAlert('Solicitando permiso de ubicación...', 'warning');
             
             try {
-                const permissionResult = await navigator.permissions.query({ name: 'geolocation' });
-                
-                if (permissionResult.state === 'denied') {
-                    showAlert('Location permission denied. Please enable location access.', 'error');
-                    startBtn.disabled = false;
-                    startBtnText.textContent = 'Start Tracking';
-                    return;
-                }
-                
                 const response = await fetch('/api/track/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
                 
-                if (!response.ok) {
-                    throw new Error('Failed to start tracking');
-                }
+                if (!response.ok) throw new Error('Error al iniciar rastreo');
                 
                 const data = await response.json();
                 trackId = data.track_id;
-                console.log('Track started with ID:', trackId);
+                console.log('Rastreo iniciado con ID:', trackId);
                 
                 // Reset state
-                routePoints = [];
+                routeSegments = [];
                 totalDistance = 0;
+                gapCount = 0;
                 trackingStartTime = Date.now();
                 lastPointTime = null;
                 lastPointData = null;
                 
-                // Clear existing markers and polylines
-                if (routePolyline) map.removeLayer(routePolyline);
+                // Clear map
+                routePolylines.forEach(line => map.removeLayer(line));
+                routePolylines = [];
                 if (startMarker) map.removeLayer(startMarker);
                 if (currentMarker) map.removeLayer(currentMarker);
                 
-                // Start watching position
+                // Start watching
                 watchId = navigator.geolocation.watchPosition(
                     handlePosition,
                     handleError,
@@ -640,77 +614,30 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 
                 isTracking = true;
                 updateUI();
-                
-                // Start duration timer
                 durationInterval = setInterval(updateDuration, 1000);
+                document.getElementById('legend').classList.add('show');
                 
                 hideAlert();
-                showToast('Tracking Started', 'Your route is being recorded!');
+                showToast('Rastreo Iniciado', '¡Tu ruta está siendo grabada! Mantén la pantalla encendida para mejores resultados.');
                 
             } catch (error) {
-                console.error('Error starting track:', error);
-                showAlert('Failed to start tracking. Please try again.', 'error');
+                console.error('Error:', error);
+                showAlert('Error al iniciar el rastreo. Por favor, intenta de nuevo.', 'error');
                 startBtn.disabled = false;
-                startBtnText.textContent = 'Start Tracking';
+                startBtnText.textContent = 'Iniciar Rastreo';
             }
         }
         
-        // Handle position update with automatic route filling
+        // Handle position
         async function handlePosition(position) {
             const lat = position.coords.latitude;
             const lon = position.coords.longitude;
             const accuracy = position.coords.accuracy;
             const currentTime = Date.now();
             
-            console.log(`Position update: ${lat}, ${lon} (accuracy: ${accuracy}m)`);
+            console.log(`Actualización de posición: ${lat}, ${lon} (precisión: ${accuracy}m)`);
             
             try {
-                // Check for gap if we have previous point
-                let shouldFillGap = false;
-                if (lastPointTime && lastPointData) {
-                    const timeDiff = (currentTime - lastPointTime) / 1000;
-                    const distance = calculateDistance(
-                        lastPointData[0], lastPointData[1],
-                        lat, lon
-                    );
-                    
-                    // Detect gap
-                    if (timeDiff > GAP_TIME_THRESHOLD || distance > GAP_DISTANCE_THRESHOLD) {
-                        console.log(`GAP DETECTED: ${timeDiff.toFixed(0)}s, ${(distance*1000).toFixed(0)}m`);
-                        shouldFillGap = true;
-                    }
-                }
-                
-                // If gap detected, fill with walking route
-                if (shouldFillGap && lastPointData) {
-                    const filledRoute = await fillRouteGap(
-                        lastPointData[0], lastPointData[1],
-                        lat, lon
-                    );
-                    
-                    if (filledRoute && filledRoute.length > 0) {
-                        // Add filled route points
-                        for (let point of filledRoute) {
-                            routePoints.push(point);
-                            
-                            // Send to backend
-                            await fetch(`/api/track/${trackId}/point`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    lat: point[0],
-                                    lon: point[1],
-                                    timestamp: new Date().toISOString(),
-                                    filled: true
-                                })
-                            });
-                        }
-                        
-                        showToast('Route Filled', 'Added realistic walking path');
-                    }
-                }
-                
-                // Send current point to backend
                 await fetch(`/api/track/${trackId}/point`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -718,53 +645,102 @@ HTML_CONTENT = '''<!DOCTYPE html>
                         lat: lat,
                         lon: lon,
                         accuracy: accuracy,
-                        timestamp: new Date().toISOString(),
-                        filled: false
+                        timestamp: new Date().toISOString()
                     })
                 });
                 
                 const newPoint = [lat, lon];
+                let isGap = false;
                 
-                // Add start marker on first point
-                if (routePoints.length === 0) {
+                // Check for gap
+                if (lastPointTime && lastPointData) {
+                    const timeDiff = (currentTime - lastPointTime) / 1000;
+                    const distance = calculateDistance(
+                        lastPointData[0], lastPointData[1], lat, lon
+                    );
+                    
+                    if (timeDiff > GAP_TIME_THRESHOLD || distance > GAP_DISTANCE_THRESHOLD) {
+                        isGap = true;
+                        gapCount++;
+                        console.log(`HUECO DETECTADO: ${timeDiff.toFixed(0)}s, ${(distance*1000).toFixed(0)}m`);
+                        showToast('Hueco GPS Detectado', 
+                            `Teléfono bloqueado o señal perdida por ${timeDiff.toFixed(0)}s. Marcando como incierto.`);
+                    }
+                }
+                
+                // Add start marker
+                if (routeSegments.length === 0) {
                     startMarker = L.marker([lat, lon], {
                         icon: L.divIcon({
                             className: 'start-marker',
-                            html: '<div style="background: #11998e; color: white; padding: 8px 12px; border-radius: 20px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.3);">START</div>',
-                            iconSize: [60, 30]
+                            html: '<div style="background: #11998e; color: white; padding: 8px 12px; border-radius: 20px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.3);">INICIO</div>',
+                            iconSize: [70, 30]
                         })
                     }).addTo(map);
                     
                     map.setView([lat, lon], 16);
-                }
-                
-                // Calculate distance
-                if (routePoints.length > 0) {
-                    const lastPoint = routePoints[routePoints.length - 1];
-                    const distance = calculateDistance(lastPoint[0], lastPoint[1], lat, lon);
-                    if (distance > 0.005) {
-                        totalDistance += distance;
+                    
+                    routeSegments.push({
+                        points: [newPoint],
+                        isGap: false
+                    });
+                } else {
+                    const currentSegment = routeSegments[routeSegments.length - 1];
+                    
+                    if (isGap) {
+                        routeSegments.push({
+                            points: [lastPointData, newPoint],
+                            isGap: true
+                        });
+                        routeSegments.push({
+                            points: [newPoint],
+                            isGap: false
+                        });
+                    } else {
+                        if (currentSegment.isGap) {
+                            routeSegments.push({
+                                points: [newPoint],
+                                isGap: false
+                            });
+                        } else {
+                            currentSegment.points.push(newPoint);
+                        }
+                    }
+                    
+                    if (lastPointData) {
+                        const distance = calculateDistance(
+                            lastPointData[0], lastPointData[1], lat, lon
+                        );
+                        if (distance > 0.005) {
+                            totalDistance += distance;
+                        }
                     }
                 }
                 
-                routePoints.push(newPoint);
+                // Redraw segments
+                routePolylines.forEach(line => map.removeLayer(line));
+                routePolylines = [];
                 
-                // Update polyline
-                if (routePolyline) {
-                    map.removeLayer(routePolyline);
-                }
+                routeSegments.forEach(segment => {
+                    if (segment.points.length > 1) {
+                        const polyline = L.polyline(segment.points, {
+                            color: segment.isGap ? '#ff6b6b' : '#667eea',
+                            weight: 5,
+                            opacity: segment.isGap ? 0.6 : 0.8,
+                            dashArray: segment.isGap ? '10, 10' : null,
+                            smoothFactor: 1
+                        }).addTo(map);
+                        
+                        if (segment.isGap) {
+                            polyline.bindPopup('⚠️ Hueco de señal GPS - el teléfono pudo estar bloqueado');
+                        }
+                        
+                        routePolylines.push(polyline);
+                    }
+                });
                 
-                routePolyline = L.polyline(routePoints, {
-                    color: '#667eea',
-                    weight: 5,
-                    opacity: 0.8,
-                    smoothFactor: 1
-                }).addTo(map);
-                
-                // Update current position marker
-                if (currentMarker) {
-                    map.removeLayer(currentMarker);
-                }
+                // Update current marker
+                if (currentMarker) map.removeLayer(currentMarker);
                 
                 currentMarker = L.circleMarker([lat, lon], {
                     radius: 10,
@@ -775,7 +751,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     fillOpacity: 1
                 }).addTo(map);
                 
-                // Add accuracy circle
                 L.circle([lat, lon], {
                     radius: accuracy,
                     fillColor: '#11998e',
@@ -785,46 +760,35 @@ HTML_CONTENT = '''<!DOCTYPE html>
                     opacity: 0.3
                 }).addTo(map);
                 
-                // Center map on current position
-                map.panTo([lat, lon], {
-                    animate: true,
-                    duration: 0.5
-                });
+                map.panTo([lat, lon], { animate: true, duration: 0.5 });
                 
                 // Update UI
-                document.getElementById('pointCount').textContent = routePoints.length;
+                const totalPoints = routeSegments.reduce((sum, seg) => sum + seg.points.length, 0);
+                document.getElementById('pointCount').textContent = totalPoints;
                 document.getElementById('distance').textContent = totalDistance.toFixed(2) + ' km';
+                document.getElementById('gapCount').textContent = gapCount;
                 
-                // Update last point data
                 lastPointTime = currentTime;
                 lastPointData = newPoint;
                 
             } catch (error) {
-                console.error('Error adding point:', error);
+                console.error('Error al añadir punto:', error);
             }
         }
         
-        // Handle geolocation error
+        // Handle error
         function handleError(error) {
-            console.error('Geolocation error:', error);
+            console.error('Error de geolocalización:', error);
             
-            switch(error.code) {
-                case error.PERMISSION_DENIED:
-                    showAlert('Location permission denied.', 'error');
-                    stopTracking();
-                    break;
-                case error.POSITION_UNAVAILABLE:
-                    console.log('Position unavailable');
-                    break;
-                case error.TIMEOUT:
-                    console.log('Position timeout');
-                    break;
+            if (error.code === error.PERMISSION_DENIED) {
+                showAlert('Permiso de ubicación denegado. Por favor, habilita el acceso a la ubicación.', 'error');
+                stopTracking();
             }
         }
         
         // Stop tracking
         async function stopTracking() {
-            console.log('Stopping tracking...');
+            console.log('Deteniendo rastreo...');
             
             if (watchId) {
                 navigator.geolocation.clearWatch(watchId);
@@ -838,22 +802,21 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             if (trackId) {
                 try {
-                    showToast('Saving Route', 'Capturing map image...');
-                    const mapImage = await captureMapImage();
-                    
                     await fetch(`/api/track/${trackId}/finish`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             total_distance: totalDistance,
-                            map_image: mapImage
+                            gap_count: gapCount,
+                            segments: routeSegments.length
                         })
                     });
                     
-                    showToast('Tracking Stopped', `Total distance: ${totalDistance.toFixed(2)} km`);
+                    const gapWarning = gapCount > 0 ? ` (${gapCount} hueco${gapCount > 1 ? 's' : ''} detectado${gapCount > 1 ? 's' : ''})` : '';
+                    showToast('Rastreo Detenido', `Distancia: ${totalDistance.toFixed(2)} km${gapWarning}`);
                     
                 } catch (error) {
-                    console.error('Error finishing track:', error);
+                    console.error('Error al finalizar rastreo:', error);
                 }
             }
             
@@ -861,61 +824,97 @@ HTML_CONTENT = '''<!DOCTYPE html>
             updateUI();
         }
         
-        // Download PDF
-        async function downloadPDF() {
+        // Download GPX
+        async function downloadGPX() {
             if (!trackId) {
-                showAlert('No track available to download', 'error');
+                showAlert('No hay rastreo disponible para descargar', 'error');
                 return;
             }
             
-            const downloadBtn = document.getElementById('downloadBtn');
-            const originalText = downloadBtn.innerHTML;
-            downloadBtn.innerHTML = '<span class="btn-icon">⬇</span><span class="spinner"></span> Generating PDF...';
-            downloadBtn.disabled = true;
+            const gpxBtn = document.getElementById('gpxBtn');
+            const originalText = gpxBtn.innerHTML;
+            gpxBtn.innerHTML = '<span class="btn-icon">📍</span><span class="spinner"></span> Generando...';
+            gpxBtn.disabled = true;
             
             try {
-                window.location.href = `/api/track/${trackId}/pdf`;
-                showToast('Success', 'PDF download started!');
+                window.location.href = `/api/track/${trackId}/gpx`;
+                showToast('Éxito', '¡Descarga de archivo GPX iniciada! Puedes subirlo a ViewGPX.com o Google My Maps.');
                 
                 setTimeout(() => {
-                    downloadBtn.innerHTML = originalText;
-                    downloadBtn.disabled = false;
+                    gpxBtn.innerHTML = originalText;
+                    gpxBtn.disabled = false;
                 }, 2000);
                 
             } catch (error) {
-                console.error('Error downloading PDF:', error);
-                showAlert('Failed to download PDF. Please try again.', 'error');
-                downloadBtn.innerHTML = originalText;
-                downloadBtn.disabled = false;
+                console.error('Error al descargar GPX:', error);
+                showAlert('Error al descargar GPX. Por favor, intenta de nuevo.', 'error');
+                gpxBtn.innerHTML = originalText;
+                gpxBtn.disabled = false;
             }
         }
         
-        // Update UI state
+        // Download PDF
+        async function downloadPDF() {
+            if (!trackId) {
+                showAlert('No hay rastreo disponible para descargar', 'error');
+                return;
+            }
+            
+            const pdfBtn = document.getElementById('pdfBtn');
+            const originalText = pdfBtn.innerHTML;
+            pdfBtn.innerHTML = '<span class="btn-icon">📄</span><span class="spinner"></span> Generando PDF...';
+            pdfBtn.disabled = true;
+            
+            try {
+                window.location.href = `/api/track/${trackId}/pdf`;
+                showToast('Éxito', '¡Descarga de informe PDF iniciada!');
+                
+                setTimeout(() => {
+                    pdfBtn.innerHTML = originalText;
+                    pdfBtn.disabled = false;
+                }, 2000);
+                
+            } catch (error) {
+                console.error('Error al descargar PDF:', error);
+                showAlert('Error al descargar PDF. Por favor, intenta de nuevo.', 'error');
+                pdfBtn.innerHTML = originalText;
+                pdfBtn.disabled = false;
+            }
+        }
+        
+        // Update UI
         function updateUI() {
             const startBtn = document.getElementById('startBtn');
             const startBtnText = document.getElementById('startBtnText');
             const stopBtn = document.getElementById('stopBtn');
-            const downloadBtn = document.getElementById('downloadBtn');
+            const gpxBtn = document.getElementById('gpxBtn');
+            const pdfBtn = document.getElementById('pdfBtn');
             const statusText = document.getElementById('statusText');
             
             if (isTracking) {
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
-                downloadBtn.disabled = true;
-                startBtnText.textContent = 'Tracking...';
-                statusText.innerHTML = '<span class="tracking-indicator active"></span>Tracking';
+                gpxBtn.disabled = true;
+                pdfBtn.disabled = true;
+                startBtnText.textContent = 'Rastreando...';
+                statusText.innerHTML = '<span class="tracking-indicator active"></span>Rastreando';
                 statusText.className = 'status-value active';
             } else {
                 startBtn.disabled = false;
-                startBtnText.textContent = 'Start Tracking';
+                startBtnText.textContent = 'Iniciar Rastreo';
                 stopBtn.disabled = true;
-                downloadBtn.disabled = trackId === null;
-                statusText.innerHTML = '<span class="tracking-indicator"></span>' + (trackId ? 'Stopped' : 'Inactive');
+                gpxBtn.disabled = trackId === null;
+                pdfBtn.disabled = trackId === null;
+                statusText.innerHTML = '<span class="tracking-indicator"></span>' + (trackId ? 'Detenido' : 'Inactivo');
                 statusText.className = 'status-value ' + (trackId ? 'active' : 'inactive');
+                
+                if (!isTracking) {
+                    document.getElementById('legend').classList.remove('show');
+                }
             }
         }
         
-        // Show alert banner
+        // Show alert
         function showAlert(message, type = 'warning') {
             const banner = document.getElementById('alertBanner');
             const messageEl = document.getElementById('alertMessage');
@@ -925,12 +924,12 @@ HTML_CONTENT = '''<!DOCTYPE html>
             banner.style.display = 'block';
         }
         
-        // Hide alert banner
+        // Hide alert
         function hideAlert() {
             document.getElementById('alertBanner').style.display = 'none';
         }
         
-        // Show toast notification
+        // Show toast
         function showToast(title, message) {
             const toast = document.getElementById('toast');
             const toastTitle = document.getElementById('toastTitle');
@@ -942,12 +941,12 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             setTimeout(() => {
                 toast.classList.remove('show');
-            }, 4000);
+            }, 5000);
         }
         
-        // Initialize on page load
+        // Initialize
         document.addEventListener('DOMContentLoaded', function() {
-            console.log('GPS Tracker initialized with route filling');
+            console.log('Rastreador GPS inicializado con detección de huecos y exportación GPX');
             initMap();
             updateUI();
         });
@@ -969,7 +968,7 @@ def start_track():
         'started_at': datetime.now().isoformat(),
         'points': [],
         'finished': False,
-        'map_image': None
+        'gap_count': 0
     }
     return jsonify({'track_id': track_id, 'status': 'started'})
 
@@ -984,95 +983,15 @@ def add_point(track_id):
         'lat': data['lat'],
         'lon': data['lon'],
         'timestamp': data.get('timestamp', datetime.now().isoformat()),
-        'accuracy': data.get('accuracy', None),
-        'filled': data.get('filled', False)
+        'accuracy': data.get('accuracy', None)
     }
     
     tracks[track_id]['points'].append(point)
     return jsonify({'status': 'point_added', 'total_points': len(tracks[track_id]['points'])})
 
-@app.route('/api/route/fill', methods=['POST'])
-def fill_route():
-    """Fill route gap using OpenRouteService API"""
-    try:
-        data = request.json
-        start = data['start']  # [lon, lat]
-        end = data['end']      # [lon, lat]
-        
-        # Check if API key is configured
-        if OPENROUTE_API_KEY == "YOUR_API_KEY_HERE":
-            print("Warning: OpenRouteService API key not configured. Returning straight line.")
-            # Return simple straight line as fallback
-            return jsonify({
-                'route': [
-                    [start[1], start[0]],
-                    [end[1], end[0]]
-                ],
-                'distance': 0
-            })
-        
-        # Call OpenRouteService API
-        headers = {
-            'Authorization': OPENROUTE_API_KEY,
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            'coordinates': [start, end],
-            'preference': 'recommended',
-            'units': 'km'
-        }
-        
-        response = requests.post(
-            OPENROUTE_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            
-            # Extract route coordinates
-            if 'routes' in result and len(result['routes']) > 0:
-                geometry = result['routes'][0]['geometry']
-                coordinates = geometry['coordinates']
-                
-                # Convert [lon, lat] to [lat, lon] for Leaflet
-                route = [[coord[1], coord[0]] for coord in coordinates]
-                distance = result['routes'][0]['summary']['distance']
-                
-                print(f"Route filled successfully: {len(route)} points, {distance} km")
-                
-                return jsonify({
-                    'route': route,
-                    'distance': distance
-                })
-        
-        print(f"OpenRouteService API error: {response.status_code}")
-        # Fallback to straight line
-        return jsonify({
-            'route': [
-                [start[1], start[0]],
-                [end[1], end[0]]
-            ],
-            'distance': 0
-        })
-        
-    except Exception as e:
-        print(f"Error filling route: {e}")
-        # Return straight line as fallback
-        return jsonify({
-            'route': [
-                [data['start'][1], data['start'][0]],
-                [data['end'][1], data['end'][0]]
-            ],
-            'distance': 0
-        })
-
 @app.route('/api/track/<track_id>/finish', methods=['POST'])
 def finish_track(track_id):
-    """Finish tracking and save map image"""
+    """Finish tracking"""
     if track_id not in tracks:
         return jsonify({'error': 'Track not found'}), 404
     
@@ -1080,13 +999,14 @@ def finish_track(track_id):
     tracks[track_id]['finished'] = True
     tracks[track_id]['finished_at'] = datetime.now().isoformat()
     tracks[track_id]['total_distance'] = data.get('total_distance', 0)
-    tracks[track_id]['map_image'] = data.get('map_image', None)
+    tracks[track_id]['gap_count'] = data.get('gap_count', 0)
+    tracks[track_id]['segments'] = data.get('segments', 0)
     
     return jsonify({'status': 'finished', 'track_id': track_id})
 
-@app.route('/api/track/<track_id>/pdf', methods=['GET'])
-def generate_pdf(track_id):
-    """Generate PDF with the route map image"""
+@app.route('/api/track/<track_id>/gpx', methods=['GET'])
+def generate_gpx(track_id):
+    """Generate GPX file"""
     if track_id not in tracks:
         return jsonify({'error': 'Track not found'}), 404
     
@@ -1094,75 +1014,148 @@ def generate_pdf(track_id):
     if len(track['points']) == 0:
         return jsonify({'error': 'No points in track'}), 400
     
-    # Create PDF in memory
+    # Generate GPX XML
+    gpx = f'''<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Rastreador GPS" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata>
+    <name>Ruta {track_id[:8]}</name>
+    <time>{track['started_at']}</time>
+  </metadata>
+  <trk>
+    <name>Ruta GPS</name>
+    <trkseg>
+'''
+    
+    for point in track['points']:
+        gpx += f'''      <trkpt lat="{point['lat']}" lon="{point['lon']}">
+        <time>{point['timestamp']}</time>
+'''
+        if point.get('accuracy'):
+            gpx += f'''        <hdop>{point['accuracy']}</hdop>
+'''
+        gpx += '''      </trkpt>
+'''
+    
+    gpx += '''    </trkseg>
+  </trk>
+</gpx>'''
+    
+    # Return as downloadable file
+    buffer = io.BytesIO(gpx.encode('utf-8'))
+    buffer.seek(0)
+    
+    return send_file(
+        buffer,
+        mimetype='application/gpx+xml',
+        as_attachment=True,
+        download_name=f'ruta_{track_id[:8]}.gpx'
+    )
+
+@app.route('/api/track/<track_id>/pdf', methods=['GET'])
+def generate_pdf(track_id):
+    """Generate PDF report (Spanish)"""
+    if track_id not in tracks:
+        return jsonify({'error': 'Track not found'}), 404
+    
+    track = tracks[track_id]
+    if len(track['points']) == 0:
+        return jsonify({'error': 'No points in track'}), 400
+    
+    # Create PDF
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
     
-    # Add title
+    # Title
     c.setFont("Helvetica-Bold", 24)
-    c.drawString(50, height - 60, "GPS Route Tracker")
+    c.drawString(50, height - 60, "Rastreador de Rutas GPS")
     
-    # Add metadata
+    # Metadata
     c.setFont("Helvetica", 12)
-    c.drawString(50, height - 90, f"Track ID: {track_id[:8]}")
-    c.drawString(50, height - 110, f"Started: {track['started_at']}")
-    c.drawString(50, height - 130, f"Finished: {track.get('finished_at', 'N/A')}")
-    c.drawString(50, height - 150, f"Total Points: {len(track['points'])}")
+    c.drawString(50, height - 100, f"ID de Ruta: {track_id[:8]}")
+    c.drawString(50, height - 120, f"Fecha de Inicio: {track['started_at'][:19].replace('T', ' ')}")
+    if track.get('finished_at'):
+        c.drawString(50, height - 140, f"Fecha de Fin: {track['finished_at'][:19].replace('T', ' ')}")
     
-    # Calculate route statistics
+    # Statistics
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 180, "Estadísticas de la Ruta")
+    
+    c.setFont("Helvetica", 12)
+    c.drawString(50, height - 210, f"Total de Puntos GPS: {len(track['points'])}")
+    
+    total_distance = track.get('total_distance', 0)
+    c.drawString(50, height - 230, f"Distancia Total: {total_distance:.2f} km")
+    
+    gap_count = track.get('gap_count', 0)
+    c.drawString(50, height - 250, f"Huecos de Señal GPS: {gap_count}")
+    
+    # Calculate route bounds
     lats = [p['lat'] for p in track['points']]
     lons = [p['lon'] for p in track['points']]
+    
+    c.drawString(50, height - 270, f"Latitud: {min(lats):.6f} a {max(lats):.6f}")
+    c.drawString(50, height - 290, f"Longitud: {min(lons):.6f} a {max(lons):.6f}")
+    
+    # Gap warning
+    if gap_count > 0:
+        c.setFillColorRGB(0.8, 0.2, 0.2)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, height - 325, f"⚠ Advertencia: {gap_count} hueco(s) de señal GPS detectado(s)")
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", 10)
+        c.drawString(50, height - 345, "Esto puede ocurrir cuando el teléfono está bloqueado o la señal GPS se pierde.")
+        c.drawString(50, height - 360, "Los huecos están marcados con líneas rojas discontinuas en el archivo GPX.")
+    
+    # Visualization instructions
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 410, "Visualización del Mapa")
+    
+    c.setFont("Helvetica", 11)
+    c.drawString(50, height - 440, "Para ver tu ruta en un mapa interactivo, sube el archivo GPX a:")
+    
+    c.setFont("Helvetica-Bold", 11)
+    c.setFillColorRGB(0.4, 0.5, 0.9)
+    c.drawString(70, height - 465, "• ViewGPX.com - https://www.viewgpx.com/")
+    c.drawString(70, height - 485, "• Google My Maps - https://www.google.com/mymaps")
+    c.drawString(70, height - 505, "• Strava - https://www.strava.com/")
+    c.setFillColorRGB(0, 0, 0)
+    
+    c.setFont("Helvetica", 10)
+    c.drawString(50, height - 535, "Estos servicios te permitirán:")
+    c.drawString(70, height - 555, "✓ Ver tu ruta sobre un mapa interactivo")
+    c.drawString(70, height - 570, "✓ Analizar velocidad y elevación")
+    c.drawString(70, height - 585, "✓ Compartir tu ruta con otros")
+    c.drawString(70, height - 600, "✓ Exportar a otros formatos (KML, KMZ, etc.)")
+    
+    # Quick view link
     center_lat = (min(lats) + max(lats)) / 2
     center_lon = (min(lons) + max(lons)) / 2
     
-    total_distance = track.get('total_distance', 0)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, height - 640, "Vista Rápida en OpenStreetMap:")
+    c.setFont("Helvetica", 9)
+    c.setFillColorRGB(0, 0, 1)
+    osm_link = f"https://www.openstreetmap.org/?mlat={center_lat}&mlon={center_lon}#map=15/{center_lat}/{center_lon}"
+    c.drawString(50, height - 660, osm_link)
+    c.setFillColorRGB(0, 0, 0)
     
-    # Count filled points
-    filled_count = sum(1 for p in track['points'] if p.get('filled', False))
+    # Tips section
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, height - 700, "Consejos para Mejores Resultados")
     
-    c.drawString(50, height - 180, f"Total Distance: {total_distance:.2f} km")
-    if filled_count > 0:
-        c.drawString(50, height - 200, f"Route-filled points: {filled_count} (realistic walking paths)")
+    c.setFont("Helvetica", 10)
+    c.drawString(50, height - 725, "• Mantén la pantalla del teléfono encendida durante el rastreo")
+    c.drawString(50, height - 740, "• Mantén la aplicación visible (no la minimices)")
+    c.drawString(50, height - 755, "• Evita guardar el teléfono en bolsillos profundos")
+    c.drawString(50, height - 770, "• Asegúrate de tener batería suficiente")
     
-    # Add route map image if available
-    if track.get('map_image'):
-        try:
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(50, height - 240, "Route Map:")
-            
-            # Decode base64 image
-            image_data = track['map_image'].split(',')[1]
-            image_bytes = base64.b64decode(image_data)
-            image = Image.open(io.BytesIO(image_bytes))
-            
-            # Save to temporary buffer
-            img_buffer = io.BytesIO()
-            image.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
-            
-            # Add image to PDF
-            img_reader = ImageReader(img_buffer)
-            img_width = 480
-            img_height = 320
-            
-            c.drawImage(img_reader, 60, height - 600, width=img_width, height=img_height, 
-                       preserveAspectRatio=True, mask='auto')
-            
-            # Add caption
-            c.setFont("Helvetica", 9)
-            c.drawString(60, height - 615, "Complete tracked route with realistic walking paths")
-            
-        except Exception as e:
-            print(f"Error adding map image to PDF: {e}")
-            c.setFont("Helvetica", 10)
-            c.drawString(50, height - 260, "Map image not available")
-    
-    # Add footer
+    # Footer
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(50, 60, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    c.drawString(50, 45, "Powered by OpenStreetMap & OpenRouteService")
-    c.drawString(50, 30, f"View at: https://www.openstreetmap.org/?mlat={center_lat}&mlon={center_lon}#map=15/{center_lat}/{center_lon}")
+    c.setFillColorRGB(0.5, 0.5, 0.5)
+    c.drawString(50, 60, f"Informe generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M:%S')}")
+    c.drawString(50, 45, "Potenciado por OpenStreetMap")
+    c.drawString(50, 30, "Descarga el archivo GPX para visualización interactiva del mapa")
     
     c.save()
     buffer.seek(0)
@@ -1171,7 +1164,7 @@ def generate_pdf(track_id):
         buffer,
         mimetype='application/pdf',
         as_attachment=True,
-        download_name=f'route_{track_id[:8]}.pdf'
+        download_name=f'informe_ruta_{track_id[:8]}.pdf'
     )
 
 @app.route('/health')
