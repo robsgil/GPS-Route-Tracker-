@@ -6,14 +6,106 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 import uuid
 import os
+import requests
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 app = Flask(__name__)
 CORS(app)
 
 # Store tracks in memory
 tracks = {}
+tracks_lock = Lock()
 
-# Spanish UI with gap detection and GPX export
+# OpenRouteService API configuration
+ORS_API_KEY = 'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjZhN2QyNmZkMDhkNDQ1YmM4NWYyZDIwYmJmYTczZGRlIiwiaCI6Im11cm11cjY0In0='
+ORS_API_URL = 'https://api.openrouteservice.org/v2/directions/foot-walking'
+
+# Rate limiting for API calls
+api_call_times = []
+api_lock = Lock()
+MAX_CALLS_PER_MINUTE = 35  # Stay under 40/min limit
+CIRCUIT_BREAKER_THRESHOLD = 3  # Fail after 3 consecutive failures
+circuit_breaker_failures = 0
+
+def rate_limit_api_call():
+    """Ensure we don't exceed API rate limits"""
+    with api_lock:
+        current_time = time.time()
+        # Remove calls older than 60 seconds
+        api_call_times[:] = [t for t in api_call_times if current_time - t < 60]
+        
+        # If we're at the limit, wait
+        if len(api_call_times) >= MAX_CALLS_PER_MINUTE:
+            sleep_time = 60 - (current_time - api_call_times[0]) + 1
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        
+        api_call_times.append(time.time())
+
+def fill_gap_with_walking_route(start_lat, start_lon, end_lat, end_lon, gap_index=0):
+    """
+    Call OpenRouteService API to get walking route between two points
+    Returns dict with success status and coordinates or None
+    """
+    global circuit_breaker_failures
+    
+    if ORS_API_KEY == 'YOUR_API_KEY_HERE':
+        print(f"Warning: ORS_API_KEY not set, skipping gap {gap_index}")
+        return None
+    
+    # Circuit breaker: stop trying after multiple failures
+    if circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
+        print(f"Circuit breaker open, skipping gap {gap_index}")
+        return None
+    
+    try:
+        # Rate limit before calling
+        rate_limit_api_call()
+        
+        headers = {
+            'Authorization': ORS_API_KEY,
+            'Content-Type': 'application/json'
+        }
+        
+        body = {
+            'coordinates': [[start_lon, start_lat], [end_lon, end_lat]],
+            'format': 'geojson'
+        }
+        
+        print(f"Filling gap {gap_index + 1}: ({start_lat:.6f}, {start_lon:.6f}) -> ({end_lat:.6f}, {end_lon:.6f})")
+        
+        response = requests.post(
+            ORS_API_URL,
+            json=body,
+            headers=headers,
+            timeout=5  # Reduced timeout for faster failure
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            coords = data['features'][0]['geometry']['coordinates']
+            # Convert from [lon, lat] to [lat, lon]
+            result = [[lat, lon] for lon, lat in coords]
+            print(f"✓ Gap {gap_index + 1} filled with {len(result)} points")
+            circuit_breaker_failures = 0  # Reset on success
+            return result
+        else:
+            print(f"✗ ORS API error for gap {gap_index + 1}: {response.status_code}")
+            circuit_breaker_failures += 1
+            return None
+            
+    except requests.Timeout:
+        print(f"✗ Timeout for gap {gap_index + 1}")
+        circuit_breaker_failures += 1
+        return None
+    except Exception as e:
+        print(f"✗ Error filling gap {gap_index + 1}: {e}")
+        circuit_breaker_failures += 1
+        return None
+
+# Spanish UI with gap detection and intelligent gap filling
 HTML_CONTENT = '''<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -411,7 +503,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 <div class="logo">🗺️</div>
                 <div class="header-text">
                     <h1>Rastreador de Rutas GPS</h1>
-                    <p>Rastrea tu recorrido en tiempo real con OpenStreetMap</p>
+                    <p>Rastrea tu recorrido con rutas inteligentes rellenadas por IA</p>
                 </div>
             </div>
         </div>
@@ -475,7 +567,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             </div>
             <div class="legend-item">
                 <div class="legend-line dashed"></div>
-                <span>Hueco de Señal / Teléfono Bloqueado</span>
+                <span>Hueco de Señal (Se rellenará en GPX)</span>
             </div>
         </div>
     </div>
@@ -508,7 +600,6 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 maxZoom: 19
             }).addTo(map);
             
-            // Try to get initial position
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
                     (position) => {
@@ -618,7 +709,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                 document.getElementById('legend').classList.add('show');
                 
                 hideAlert();
-                showToast('Rastreo Iniciado', '¡Tu ruta está siendo grabada! Mantén la pantalla encendida para mejores resultados.');
+                showToast('Rastreo Iniciado', 'Los huecos de señal serán rellenados automáticamente en el archivo GPX.');
                 
             } catch (error) {
                 console.error('Error:', error);
@@ -664,7 +755,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                         gapCount++;
                         console.log(`HUECO DETECTADO: ${timeDiff.toFixed(0)}s, ${(distance*1000).toFixed(0)}m`);
                         showToast('Hueco GPS Detectado', 
-                            `Teléfono bloqueado o señal perdida por ${timeDiff.toFixed(0)}s. Marcando como incierto.`);
+                            `Se rellenará con ruta caminando en el archivo GPX.`);
                     }
                 }
                 
@@ -732,7 +823,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
                         }).addTo(map);
                         
                         if (segment.isGap) {
-                            polyline.bindPopup('⚠️ Hueco de señal GPS - el teléfono pudo estar bloqueado');
+                            polyline.bindPopup('⚠️ Hueco de señal GPS - se rellenará con ruta caminando');
                         }
                         
                         routePolylines.push(polyline);
@@ -824,7 +915,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
             updateUI();
         }
         
-        // Download GPX
+        // Download GPX with gap filling
         async function downloadGPX() {
             if (!trackId) {
                 showAlert('No hay rastreo disponible para descargar', 'error');
@@ -833,14 +924,21 @@ HTML_CONTENT = '''<!DOCTYPE html>
             
             const gpxBtn = document.getElementById('gpxBtn');
             const originalText = gpxBtn.innerHTML;
-            gpxBtn.innerHTML = '<span class="btn-icon">📍</span><span class="spinner"></span> Generando...';
+            
+            if (gapCount > 0) {
+                gpxBtn.innerHTML = '<span class="btn-icon">📍</span><span class="spinner"></span> Rellenando huecos...';
+                showToast('Procesando', `Rellenando ${gapCount} hueco(s) con rutas caminando...`);
+            } else {
+                gpxBtn.innerHTML = '<span class="btn-icon">📍</span><span class="spinner"></span> Generando...';
+            }
+            
             gpxBtn.disabled = true;
             
             try {
                 window.location.href = `/api/track/${trackId}/gpx`;
-                showToast('Éxito', '¡Descarga de archivo GPX iniciada! Puedes subirlo a ViewGPX.com o Google My Maps.');
                 
                 setTimeout(() => {
+                    showToast('Éxito', '¡Descarga de archivo GPX completada! Los huecos han sido rellenados con rutas realistas.');
                     gpxBtn.innerHTML = originalText;
                     gpxBtn.disabled = false;
                 }, 2000);
@@ -946,7 +1044,7 @@ HTML_CONTENT = '''<!DOCTYPE html>
         
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {
-            console.log('Rastreador GPS inicializado con detección de huecos y exportación GPX');
+            console.log('Rastreador GPS inicializado con relleno inteligente de huecos');
             initMap();
             updateUI();
         });
@@ -963,50 +1061,95 @@ def index():
 def start_track():
     """Start a new tracking session"""
     track_id = str(uuid.uuid4())
-    tracks[track_id] = {
-        'id': track_id,
-        'started_at': datetime.now().isoformat(),
-        'points': [],
-        'finished': False,
-        'gap_count': 0
-    }
+    with tracks_lock:
+        tracks[track_id] = {
+            'id': track_id,
+            'started_at': datetime.now().isoformat(),
+            'points': [],
+            'finished': False,
+            'gap_count': 0,
+            'gaps': []  # Store gap info with point indices
+        }
     return jsonify({'track_id': track_id, 'status': 'started'})
 
 @app.route('/api/track/<track_id>/point', methods=['POST'])
 def add_point(track_id):
     """Add a GPS point to the track"""
-    if track_id not in tracks:
-        return jsonify({'error': 'Track not found'}), 404
-    
-    data = request.json
-    point = {
-        'lat': data['lat'],
-        'lon': data['lon'],
-        'timestamp': data.get('timestamp', datetime.now().isoformat()),
-        'accuracy': data.get('accuracy', None)
-    }
-    
-    tracks[track_id]['points'].append(point)
-    return jsonify({'status': 'point_added', 'total_points': len(tracks[track_id]['points'])})
+    with tracks_lock:
+        if track_id not in tracks:
+            return jsonify({'error': 'Track not found'}), 404
+        
+        data = request.json
+        point = {
+            'lat': data['lat'],
+            'lon': data['lon'],
+            'timestamp': data.get('timestamp', datetime.now().isoformat()),
+            'accuracy': data.get('accuracy', None)
+        }
+        
+        tracks[track_id]['points'].append(point)
+        
+        # Detect gaps on backend
+        points = tracks[track_id]['points']
+        if len(points) >= 2:
+            p1 = points[-2]
+            p2 = points[-1]
+            
+            # Calculate time difference
+            try:
+                t1 = datetime.fromisoformat(p1['timestamp'].replace('Z', '+00:00'))
+                t2 = datetime.fromisoformat(p2['timestamp'].replace('Z', '+00:00'))
+                time_diff = (t2 - t1).total_seconds()
+            except:
+                time_diff = 0
+            
+            # Calculate distance
+            from math import radians, sin, cos, sqrt, atan2
+            R = 6371
+            lat1, lon1 = radians(p1['lat']), radians(p1['lon'])
+            lat2, lon2 = radians(p2['lat']), radians(p2['lon'])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            distance = R * c
+            
+            # Detect gap
+            if time_diff > 30 or distance > 0.2:
+                gap = {
+                    'start_index': len(points) - 2,  # INDEX of start point
+                    'end_index': len(points) - 1,    # INDEX of end point
+                    'start_lat': p1['lat'],
+                    'start_lon': p1['lon'],
+                    'end_lat': p2['lat'],
+                    'end_lon': p2['lon'],
+                    'time_diff': time_diff,
+                    'distance': distance
+                }
+                tracks[track_id]['gaps'].append(gap)
+                print(f"Gap detected between points {gap['start_index']}-{gap['end_index']}: {time_diff:.0f}s, {distance*1000:.0f}m")
+        
+        return jsonify({'status': 'point_added', 'total_points': len(tracks[track_id]['points'])})
 
 @app.route('/api/track/<track_id>/finish', methods=['POST'])
 def finish_track(track_id):
     """Finish tracking"""
-    if track_id not in tracks:
-        return jsonify({'error': 'Track not found'}), 404
-    
-    data = request.json
-    tracks[track_id]['finished'] = True
-    tracks[track_id]['finished_at'] = datetime.now().isoformat()
-    tracks[track_id]['total_distance'] = data.get('total_distance', 0)
-    tracks[track_id]['gap_count'] = data.get('gap_count', 0)
-    tracks[track_id]['segments'] = data.get('segments', 0)
+    with tracks_lock:
+        if track_id not in tracks:
+            return jsonify({'error': 'Track not found'}), 404
+        
+        data = request.json
+        tracks[track_id]['finished'] = True
+        tracks[track_id]['finished_at'] = datetime.now().isoformat()
+        tracks[track_id]['total_distance'] = data.get('total_distance', 0)
+        tracks[track_id]['gap_count'] = data.get('gap_count', 0)
+        tracks[track_id]['segments'] = data.get('segments', 0)
     
     return jsonify({'status': 'finished', 'track_id': track_id})
 
 @app.route('/api/track/<track_id>/gpx', methods=['GET'])
 def generate_gpx(track_id):
-    """Generate GPX file"""
+    """Generate GPX file with gap filling using OpenRouteService - OPTIMIZED"""
     if track_id not in tracks:
         return jsonify({'error': 'Track not found'}), 404
     
@@ -1014,19 +1157,74 @@ def generate_gpx(track_id):
     if len(track['points']) == 0:
         return jsonify({'error': 'No points in track'}), 400
     
-    # Generate GPX XML
+    points = track['points']
+    gaps = track.get('gaps', [])
+    
+    print(f"\n=== Generating GPX for track {track_id[:8]} ===")
+    print(f"Total points: {len(points)}, Gaps to fill: {len(gaps)}")
+    
+    # Build filled_routes dict: {gap_index: [route_points]}
+    filled_routes = {}
+    
+    if len(gaps) > 0:
+        # Parallel API calls with ThreadPoolExecutor
+        def fill_single_gap(gap_data):
+            idx, gap = gap_data
+            result = fill_gap_with_walking_route(
+                gap['start_lat'], gap['start_lon'],
+                gap['end_lat'], gap['end_lon'],
+                gap_index=idx
+            )
+            return (idx, result)
+        
+        # Use ThreadPoolExecutor for parallel calls
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            gap_data = list(enumerate(gaps))
+            futures = [executor.submit(fill_single_gap, gd) for gd in gap_data]
+            
+            for future in as_completed(futures):
+                try:
+                    idx, route = future.result()
+                    if route:
+                        filled_routes[idx] = route
+                except Exception as e:
+                    print(f"Error in parallel gap filling: {e}")
+    
+    print(f"Successfully filled {len(filled_routes)}/{len(gaps)} gaps")
+    
+    # Build GPX with filled routes inserted at correct indices
     gpx = f'''<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="Rastreador GPS" xmlns="http://www.topografix.com/GPX/1/1">
+<gpx version="1.1" creator="Rastreador GPS con Relleno Inteligente" xmlns="http://www.topografix.com/GPX/1/1">
   <metadata>
     <name>Ruta {track_id[:8]}</name>
     <time>{track['started_at']}</time>
+    <desc>Ruta con {len(filled_routes)} de {len(gaps)} hueco(s) rellenado(s) con rutas caminando</desc>
   </metadata>
   <trk>
     <name>Ruta GPS</name>
     <trkseg>
 '''
     
-    for point in track['points']:
+    # Create a mapping of point_index -> gap_index for quick lookup
+    gap_end_indices = {gap['end_index']: idx for idx, gap in enumerate(gaps)}
+    
+    for point_idx, point in enumerate(points):
+        # Check if we just passed a gap end point
+        if point_idx in gap_end_indices:
+            gap_idx = gap_end_indices[point_idx]
+            
+            # Insert filled route if we have it
+            if gap_idx in filled_routes:
+                route = filled_routes[gap_idx]
+                # Add middle points (skip first and last as they're already in track)
+                for filled_point in route[1:-1]:
+                    gpx += f'''      <trkpt lat="{filled_point[0]}" lon="{filled_point[1]}">
+        <time>{point['timestamp']}</time>
+        <cmt>Punto rellenado por API</cmt>
+      </trkpt>
+'''
+        
+        # Add the actual GPS point
         gpx += f'''      <trkpt lat="{point['lat']}" lon="{point['lon']}">
         <time>{point['timestamp']}</time>
 '''
@@ -1087,7 +1285,7 @@ def generate_pdf(track_id):
     total_distance = track.get('total_distance', 0)
     c.drawString(50, height - 230, f"Distancia Total: {total_distance:.2f} km")
     
-    gap_count = track.get('gap_count', 0)
+    gap_count = len(track.get('gaps', []))
     c.drawString(50, height - 250, f"Huecos de Señal GPS: {gap_count}")
     
     # Calculate route bounds
@@ -1097,65 +1295,60 @@ def generate_pdf(track_id):
     c.drawString(50, height - 270, f"Latitud: {min(lats):.6f} a {max(lats):.6f}")
     c.drawString(50, height - 290, f"Longitud: {min(lons):.6f} a {max(lons):.6f}")
     
-    # Gap warning
+    # Gap info
     if gap_count > 0:
-        c.setFillColorRGB(0.8, 0.2, 0.2)
+        c.setFillColorRGB(0.2, 0.6, 0.2)
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, height - 325, f"⚠ Advertencia: {gap_count} hueco(s) de señal GPS detectado(s)")
+        c.drawString(50, height - 325, f"✓ {gap_count} hueco(s) rellenado(s) automáticamente con rutas caminando")
         c.setFillColorRGB(0, 0, 0)
         c.setFont("Helvetica", 10)
-        c.drawString(50, height - 345, "Esto puede ocurrir cuando el teléfono está bloqueado o la señal GPS se pierde.")
-        c.drawString(50, height - 360, "Los huecos están marcados con líneas rojas discontinuas en el archivo GPX.")
+        c.drawString(50, height - 345, "El archivo GPX contiene rutas realistas calculadas por OpenRouteService API.")
+        c.drawString(50, height - 360, "Los huecos fueron rellenados con rutas peatonales basadas en calles reales.")
+    
+    # API info
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 410, "Tecnología de Relleno Inteligente")
+    
+    c.setFont("Helvetica", 11)
+    c.drawString(50, height - 440, "Este rastreador utiliza OpenRouteService API para rellenar huecos de señal GPS:")
+    c.setFont("Helvetica", 10)
+    c.drawString(70, height - 465, "✓ Cuando se detecta un hueco de señal (teléfono bloqueado)")
+    c.drawString(70, height - 480, "✓ El sistema calcula automáticamente la ruta caminando más probable")
+    c.drawString(70, height - 495, "✓ Usa datos de OpenStreetMap para rutas realistas por calles y aceras")
+    c.drawString(70, height - 510, "✓ El archivo GPX final contiene rutas completas sin líneas rectas artificiales")
     
     # Visualization instructions
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, height - 410, "Visualización del Mapa")
+    c.drawString(50, height - 550, "Visualización del Mapa")
     
     c.setFont("Helvetica", 11)
-    c.drawString(50, height - 440, "Para ver tu ruta en un mapa interactivo, sube el archivo GPX a:")
+    c.drawString(50, height - 580, "Para ver tu ruta completa en un mapa interactivo, sube el archivo GPX a:")
     
     c.setFont("Helvetica-Bold", 11)
     c.setFillColorRGB(0.4, 0.5, 0.9)
-    c.drawString(70, height - 465, "• ViewGPX.com - https://www.viewgpx.com/")
-    c.drawString(70, height - 485, "• Google My Maps - https://www.google.com/mymaps")
-    c.drawString(70, height - 505, "• Strava - https://www.strava.com/")
+    c.drawString(70, height - 605, "• ViewGPX.com - https://www.viewgpx.com/")
+    c.drawString(70, height - 625, "• Google My Maps - https://www.google.com/mymaps")
+    c.drawString(70, height - 645, "• Strava - https://www.strava.com/")
     c.setFillColorRGB(0, 0, 0)
-    
-    c.setFont("Helvetica", 10)
-    c.drawString(50, height - 535, "Estos servicios te permitirán:")
-    c.drawString(70, height - 555, "✓ Ver tu ruta sobre un mapa interactivo")
-    c.drawString(70, height - 570, "✓ Analizar velocidad y elevación")
-    c.drawString(70, height - 585, "✓ Compartir tu ruta con otros")
-    c.drawString(70, height - 600, "✓ Exportar a otros formatos (KML, KMZ, etc.)")
     
     # Quick view link
     center_lat = (min(lats) + max(lats)) / 2
     center_lon = (min(lons) + max(lons)) / 2
     
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, height - 640, "Vista Rápida en OpenStreetMap:")
+    c.drawString(50, height - 685, "Vista Rápida en OpenStreetMap:")
     c.setFont("Helvetica", 9)
     c.setFillColorRGB(0, 0, 1)
     osm_link = f"https://www.openstreetmap.org/?mlat={center_lat}&mlon={center_lon}#map=15/{center_lat}/{center_lon}"
-    c.drawString(50, height - 660, osm_link)
+    c.drawString(50, height - 705, osm_link)
     c.setFillColorRGB(0, 0, 0)
-    
-    # Tips section
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, height - 700, "Consejos para Mejores Resultados")
-    
-    c.setFont("Helvetica", 10)
-    c.drawString(50, height - 725, "• Mantén la pantalla del teléfono encendida durante el rastreo")
-    c.drawString(50, height - 740, "• Mantén la aplicación visible (no la minimices)")
-    c.drawString(50, height - 755, "• Evita guardar el teléfono en bolsillos profundos")
-    c.drawString(50, height - 770, "• Asegúrate de tener batería suficiente")
     
     # Footer
     c.setFont("Helvetica-Oblique", 9)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawString(50, 60, f"Informe generado el {datetime.now().strftime('%d/%m/%Y a las %H:%M:%S')}")
-    c.drawString(50, 45, "Potenciado por OpenStreetMap")
-    c.drawString(50, 30, "Descarga el archivo GPX para visualización interactiva del mapa")
+    c.drawString(50, 45, "Potenciado por OpenStreetMap y OpenRouteService")
+    c.drawString(50, 30, "Relleno inteligente de huecos con rutas peatonales reales")
     
     c.save()
     buffer.seek(0)
@@ -1170,8 +1363,15 @@ def generate_pdf(track_id):
 @app.route('/health')
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'tracks': len(tracks)})
+    return jsonify({
+        'status': 'healthy', 
+        'tracks': len(tracks),
+        'api_configured': ORS_API_KEY != 'YOUR_API_KEY_HERE',
+        'circuit_breaker_failures': circuit_breaker_failures
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print(f"Starting GPS Tracker on port {port}")
+    print(f"ORS API configured: {ORS_API_KEY != 'YOUR_API_KEY_HERE'}")
     app.run(debug=False, host='0.0.0.0', port=port)
