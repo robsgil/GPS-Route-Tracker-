@@ -19,7 +19,8 @@ tracks = {}
 tracks_lock = Lock()
 
 # OpenRouteService API configuration
-ORS_API_KEY = 'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjZhN2QyNmZkMDhkNDQ1YmM4NWYyZDIwYmJmYTczZGRlIiwiaCI6Im11cm11cjY0In0='
+#ORS_API_KEY = os.environ.get('ORS_API_KEY', 'YOUR_API_KEY_HERE')
+ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjZhN2QyNmZkMDhkNDQ1YmM4NWYyZDIwYmJmYTczZGRlIiwiaCI6Im11cm11cjY0In0="
 ORS_API_URL = 'https://api.openrouteservice.org/v2/directions/foot-walking'
 
 # Rate limiting for API calls
@@ -89,6 +90,10 @@ def fill_gap_with_walking_route(start_lat, start_lon, end_lat, end_lon, gap_inde
             # Convert from [lon, lat] to [lat, lon]
             result = [[lat, lon] for lon, lat in coords]
             print(f"✓ Gap {gap_index + 1} filled with {len(result)} points")
+            print(f"  First point: [{result[0][0]:.6f}, {result[0][1]:.6f}]")
+            print(f"  Last point: [{result[-1][0]:.6f}, {result[-1][1]:.6f}]")
+            if len(result) <= 2:
+                print(f"  ⚠ WARNING: Route has only {len(result)} points (start+end), no middle points to insert!")
             circuit_breaker_failures = 0  # Reset on success
             return result
         else:
@@ -1163,6 +1168,11 @@ def generate_gpx(track_id):
     print(f"\n=== Generating GPX for track {track_id[:8]} ===")
     print(f"Total points: {len(points)}, Gaps to fill: {len(gaps)}")
     
+    # DEBUG: Print gap details
+    for idx, gap in enumerate(gaps):
+        print(f"Gap {idx}: start_idx={gap['start_index']}, end_idx={gap['end_index']}, "
+              f"coords=({gap['start_lat']:.6f},{gap['start_lon']:.6f}) -> ({gap['end_lat']:.6f},{gap['end_lon']:.6f})")
+    
     # Build filled_routes dict: {gap_index: [route_points]}
     filled_routes = {}
     
@@ -1187,10 +1197,14 @@ def generate_gpx(track_id):
                     idx, route = future.result()
                     if route:
                         filled_routes[idx] = route
+                        print(f"✓ Filled route for gap {idx}: {len(route)} points")
+                    else:
+                        print(f"✗ No route returned for gap {idx}")
                 except Exception as e:
-                    print(f"Error in parallel gap filling: {e}")
+                    print(f"✗ Error in parallel gap filling: {e}")
     
     print(f"Successfully filled {len(filled_routes)}/{len(gaps)} gaps")
+    print(f"filled_routes dict keys: {list(filled_routes.keys())}")
     
     # Build GPX with filled routes inserted at correct indices
     gpx = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -1207,7 +1221,9 @@ def generate_gpx(track_id):
     
     # Create a mapping of point_index -> gap_index for quick lookup
     gap_end_indices = {gap['end_index']: idx for idx, gap in enumerate(gaps)}
+    print(f"Gap end indices mapping: {gap_end_indices}")
     
+    inserted_count = 0
     for point_idx, point in enumerate(points):
         # Check if we just passed a gap end point
         if point_idx in gap_end_indices:
@@ -1216,13 +1232,18 @@ def generate_gpx(track_id):
             # Insert filled route if we have it
             if gap_idx in filled_routes:
                 route = filled_routes[gap_idx]
+                middle_points = route[1:-1]
+                print(f"→ Inserting {len(middle_points)} filled points before point {point_idx} (gap {gap_idx})")
                 # Add middle points (skip first and last as they're already in track)
-                for filled_point in route[1:-1]:
+                for filled_point in middle_points:
                     gpx += f'''      <trkpt lat="{filled_point[0]}" lon="{filled_point[1]}">
         <time>{point['timestamp']}</time>
         <cmt>Punto rellenado por API</cmt>
       </trkpt>
 '''
+                    inserted_count += 1
+            else:
+                print(f"⚠ Gap {gap_idx} at point {point_idx} has NO filled route")
         
         # Add the actual GPS point
         gpx += f'''      <trkpt lat="{point['lat']}" lon="{point['lon']}">
@@ -1233,6 +1254,8 @@ def generate_gpx(track_id):
 '''
         gpx += '''      </trkpt>
 '''
+    
+    print(f"✓ Inserted {inserted_count} filled points into GPX")
     
     gpx += '''    </trkseg>
   </trk>
@@ -1368,6 +1391,22 @@ def health():
         'tracks': len(tracks),
         'api_configured': ORS_API_KEY != 'YOUR_API_KEY_HERE',
         'circuit_breaker_failures': circuit_breaker_failures
+    })
+
+@app.route('/api/track/<track_id>/debug', methods=['GET'])
+def debug_track(track_id):
+    """Debug endpoint to see track details"""
+    if track_id not in tracks:
+        return jsonify({'error': 'Track not found'}), 404
+    
+    track = tracks[track_id]
+    return jsonify({
+        'track_id': track_id,
+        'points_count': len(track['points']),
+        'gaps_count': len(track.get('gaps', [])),
+        'gaps': track.get('gaps', []),
+        'first_3_points': track['points'][:3] if len(track['points']) > 0 else [],
+        'last_3_points': track['points'][-3:] if len(track['points']) > 0 else []
     })
 
 if __name__ == '__main__':
